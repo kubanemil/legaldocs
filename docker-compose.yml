@@ -1,0 +1,119 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    networks:
+      - external-net
+    environment:
+      POSTGRES_DB: legaldocs
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d legaldocs"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - external-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    build:
+      context: .
+      dockerfile: parent/Dockerfile
+    command: alembic upgrade head
+    networks:
+      - external-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/legaldocs
+
+  api:
+    build:
+      context: .
+      dockerfile: parent/Dockerfile
+    command: uvicorn parent.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    networks:
+      - external-net
+      - enclave-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/legaldocs
+      REDIS_URL: redis://redis:6379/0
+      ENCLAVE_HOST: enclave
+      ENCLAVE_PORT: "8443"
+      CA_CERT_PATH: /certs/ca.crt
+      CLIENT_CERT_PATH: /certs/parent.crt
+      CLIENT_KEY_PATH: /certs/parent.key
+    volumes:
+      - ./certs:/certs:ro
+
+  worker:
+    build:
+      context: .
+      dockerfile: parent/Dockerfile
+    command: celery -A parent.workers.celery_app worker --loglevel=info
+    networks:
+      - external-net
+      - enclave-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/legaldocs
+      REDIS_URL: redis://redis:6379/0
+      ENCLAVE_HOST: enclave
+      ENCLAVE_PORT: "8443"
+      CA_CERT_PATH: /certs/ca.crt
+      CLIENT_CERT_PATH: /certs/parent.crt
+      CLIENT_KEY_PATH: /certs/parent.key
+    volumes:
+      - ./certs:/certs:ro
+
+  enclave:
+    build:
+      context: .
+      dockerfile: enclave/Dockerfile
+    networks:
+      - enclave-net
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      ENCLAVE_CERT_PATH: /certs/enclave.crt
+      ENCLAVE_KEY_PATH: /certs/enclave.key
+      CA_CERT_PATH: /certs/ca.crt
+    volumes:
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import ssl,urllib.request; ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_cert_chain('/certs/parent.crt','/certs/parent.key'); ctx.load_verify_locations('/certs/ca.crt'); ctx.check_hostname=False; urllib.request.urlopen('https://localhost:8443/health',context=ctx)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  external-net:
+    driver: bridge
+  enclave-net:
+    driver: bridge
+    internal: true
