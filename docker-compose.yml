@@ -23,6 +23,22 @@ services:
       timeout: 5s
       retries: 5
 
+  ganache:
+    image: trufflesuite/ganache:latest
+    networks:
+      - external-net
+    command: >
+      --deterministic
+      --accounts 10
+      --defaultBalanceEther 1000
+      --host 0.0.0.0
+      --port 8545
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8545 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   migrate:
     build:
       context: .
@@ -52,6 +68,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      ganache:
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     environment:
@@ -62,6 +80,7 @@ services:
       CA_CERT_PATH: /certs/ca.crt
       CLIENT_CERT_PATH: /certs/parent.crt
       CLIENT_KEY_PATH: /certs/parent.key
+      ETH_RPC_URL: http://ganache:8545
     volumes:
       - ./certs:/certs:ro
 
@@ -76,6 +95,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      ganache:
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     environment:
@@ -86,6 +107,7 @@ services:
       CA_CERT_PATH: /certs/ca.crt
       CLIENT_CERT_PATH: /certs/parent.crt
       CLIENT_KEY_PATH: /certs/parent.key
+      ETH_RPC_URL: http://ganache:8545
     volumes:
       - ./certs:/certs:ro
 

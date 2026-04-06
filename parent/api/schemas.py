@@ -37,6 +37,9 @@ class DocumentStatusResponse(BaseModel):
     id: str
     status: str
     encrypted_result: Optional[str] = None  # base64-encoded
+    content_hash: Optional[str] = None
+    result_hash: Optional[str] = None
+    tx_hash: Optional[str] = None
     error_message: Optional[str] = None
     created_at: str
     updated_at: str

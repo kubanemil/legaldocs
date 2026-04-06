@@ -28,6 +28,9 @@ class Document(Base):
     content_type = Column(String(128), nullable=True)
     encrypted_content = Column(LargeBinary, nullable=False)
     encrypted_result = Column(LargeBinary, nullable=True)
+    content_hash = Column(String(66), nullable=True)
+    result_hash = Column(String(66), nullable=True)
+    tx_hash = Column(String(66), nullable=True)
     status = Column(String(20), nullable=False, default="PENDING")
     error_message = Column(Text, nullable=True)
     created_at = Column(

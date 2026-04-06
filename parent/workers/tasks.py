@@ -1,9 +1,10 @@
 """Celery task definitions for the LegalDocs processing pipeline.
 
-Three-task chain: ingest_document -> forward_to_enclave -> store_results
+Four-task chain: ingest_document -> forward_to_enclave -> store_results -> anchor_on_chain
 """
 
 import base64
+import hashlib
 import logging
 import os
 import ssl
@@ -20,6 +21,12 @@ from parent.logging_config import setup_logging
 from parent.workers.celery_app import celery_app
 
 logger = setup_logging("worker")
+
+
+def _compute_hex_hash(data: bytes) -> str:
+    """Return the keccak-256 hash of data as a 0x-prefixed hex string."""
+    from web3 import Web3
+    return "0x" + Web3.keccak(data).hex()
 
 
 def _get_db_session() -> Session:
@@ -213,6 +220,8 @@ def store_results(self: Task, result: dict) -> str:
         tenant_id = doc.tenant_id
         doc.encrypted_result = base64.b64decode(encrypted_result_b64)
         doc.status = "COMPLETED"
+        doc.content_hash = _compute_hex_hash(doc.encrypted_content)
+        doc.result_hash = _compute_hex_hash(doc.encrypted_result)
         session.commit()
         duration_ms = (time.monotonic() - start) * 1000
         logger.info(
@@ -240,5 +249,71 @@ def store_results(self: Task, result: dict) -> str:
             extra={"correlation_id": document_id, "stage": "worker.store"},
         )
         raise
+    finally:
+        session.close()
+
+
+@celery_app.task(
+    bind=True,
+    name="parent.workers.tasks.anchor_on_chain",
+    max_retries=3,
+    default_retry_delay=5,
+)
+def anchor_on_chain(self: Task, document_id: str) -> str:
+    """Anchor document content and result hashes on Ethereum.
+
+    Reads the precomputed hashes from the DB, submits them to the
+    DocumentRegistry smart contract, and stores the transaction hash.
+
+    Args:
+        document_id: UUID string of the document.
+
+    Returns:
+        The document_id string.
+    """
+    from parent.blockchain import anchor_document
+
+    start = time.monotonic()
+    session = _get_db_session()
+    try:
+        doc = session.query(Document).filter(Document.id == document_id).first()
+        if doc is None:
+            raise ValueError(f"Document {document_id} not found")
+
+        if not doc.content_hash or not doc.result_hash:
+            raise ValueError(f"Document {document_id} missing hashes")
+
+        content_hash_bytes = bytes.fromhex(doc.content_hash[2:])
+        result_hash_bytes = bytes.fromhex(doc.result_hash[2:])
+
+        tx_hash = anchor_document(
+            document_id=document_id,
+            content_hash=content_hash_bytes,
+            result_hash=result_hash_bytes,
+            tenant_id=doc.tenant_id,
+        )
+
+        doc.tx_hash = tx_hash
+        session.commit()
+
+        duration_ms = (time.monotonic() - start) * 1000
+        logger.info(
+            "Document anchored on-chain",
+            extra={
+                "correlation_id": document_id,
+                "tenant_id": doc.tenant_id,
+                "tx_hash": tx_hash,
+                "stage": "worker.anchor",
+                "duration_ms": round(duration_ms, 2),
+            },
+        )
+        return document_id
+    except Exception as exc:
+        session.rollback()
+        logger.exception(
+            "anchor_on_chain failed",
+            extra={"correlation_id": document_id, "stage": "worker.anchor"},
+        )
+        raise self.retry(exc=exc, countdown=5, max_retries=3)
     finally:
         session.close()

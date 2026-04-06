@@ -34,5 +34,5 @@ Thumbs.db
 # Pipeline state
 .pipeline/
 
-# Claude Code local config
+# Local config
 .claude/

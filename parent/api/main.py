@@ -24,7 +24,7 @@ from parent.api.schemas import (
 )
 from parent.logging_config import setup_logging
 from parent.models.models import Document
-from parent.workers.tasks import forward_to_enclave, ingest_document, store_results
+from parent.workers.tasks import anchor_on_chain, forward_to_enclave, ingest_document, store_results
 
 logger = setup_logging("api")
 
@@ -116,11 +116,12 @@ async def submit_document(
 
     document_id = str(doc.id)
 
-    # Dispatch Celery chain: ingest -> forward -> store
+    # Dispatch Celery chain: ingest -> forward -> store -> anchor on-chain
     pipeline = chain(
         ingest_document.s(document_id),
         forward_to_enclave.s(),
         store_results.s(),
+        anchor_on_chain.s(),
     )
     pipeline.apply_async()
 
@@ -166,6 +167,9 @@ async def list_documents(
                 id=str(doc.id),
                 status=doc.status,
                 encrypted_result=encrypted_result_b64,
+                content_hash=doc.content_hash,
+                result_hash=doc.result_hash,
+                tx_hash=doc.tx_hash,
                 error_message=doc.error_message,
                 created_at=doc.created_at.isoformat(),
                 updated_at=doc.updated_at.isoformat(),
@@ -215,6 +219,9 @@ async def get_document_status(
         id=str(doc.id),
         status=doc.status,
         encrypted_result=encrypted_result_b64,
+        content_hash=doc.content_hash,
+        result_hash=doc.result_hash,
+        tx_hash=doc.tx_hash,
         error_message=doc.error_message,
         created_at=doc.created_at.isoformat(),
         updated_at=doc.updated_at.isoformat(),

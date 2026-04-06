@@ -1,10 +1,10 @@
-# Project Plan: Privacy-Preserving Legal Document Processing Pipeline
+# Project Plan: Privacy-Preserving Legal Document Processing Pipeline with Blockchain Anchoring
 
 ## Vision & Goals
 
 **Problem:** Process legal documents (extract structured data from unstructured text) while guaranteeing that documents remain private — not visible to the API server, developers, or anyone except the document owner and the verified processing enclave.
 
-**Goal:** A locally runnable MVP that mirrors the architecture of a production AWS Nitro Enclave-based pipeline, using Docker to simulate enclave isolation and client-side encryption to enforce end-to-end privacy.
+**Goal:** A locally runnable MVP that mirrors the architecture of a production AWS Nitro Enclave-based pipeline, using Docker to simulate enclave isolation, client-side encryption for end-to-end privacy, and Ethereum blockchain anchoring for tamper-proof audit trails.
 
 **Non-Goals:**
 - High-quality NLP/ML extraction (regex is fine)
@@ -94,6 +94,7 @@ Client                     Parent (API/Worker)          Enclave                S
 | RDS PostgreSQL               | PostgreSQL container                                |
 | SQS / Celery on SQS          | Redis + Celery                                      |
 | S3 (raw doc storage)         | PostgreSQL (stores encrypted blobs)                 |
+| Ethereum L1/L2               | Ganache (local deterministic chain)                 |
 
 ---
 
@@ -110,6 +111,8 @@ Client                     Parent (API/Worker)          Enclave                S
 | 7  | Client-side encryption    | RSA/AES hybrid (enclave public key)        | Simulates KMS envelope encryption pattern                                 |
 | 8  | Attestation simulation    | Enclave returns signed metadata + cert     | Simulates Nitro attestation document without hardware                     |
 | 9  | Database stores           | Only ciphertext + metadata, never plaintext| Mirrors production: DB is outside trust boundary                          |
+| 10 | Blockchain anchoring      | Solidity contract on local Ganache          | Immutable audit trail; keccak-256 hashes prove document integrity         |
+| 11 | On-chain data             | Only hashes, never content                  | Blockchain sees zero plaintext; privacy preserved on public ledger        |
 
 ---
 
@@ -122,6 +125,7 @@ Client                     Parent (API/Worker)          Enclave                S
 | PostgreSQL                 | **No**          | Stores encrypted blobs and metadata only                |
 | Redis                      | **No**          | Task queue contains doc IDs, not content                |
 | Enclave                    | Yes             | Decrypts inside isolated container                      |
+| Blockchain                 | **No**          | Only stores keccak-256 hashes of ciphertext             |
 | Developer with host access | **No**          | Can't read enclave memory; parent only has ciphertext   |
 
 ---
@@ -135,6 +139,7 @@ Client                     Parent (API/Worker)          Enclave                S
 | M2 | **Processing Pipeline**    | Celery chain: receive ciphertext → forward to enclave → store result |
 | M3 | **Tenant Isolation**       | Multi-tenant scoping on API and DB level                             |
 | M4 | **Verification & Demo**    | Prove privacy works, demo script, logging                            |
+| M5 | **Blockchain Anchoring**   | On-chain document hash notarization via Ethereum smart contract      |
 
 > **Note:** Encryption is in M1, not bolted on later. The parent should never see plaintext at any milestone.
 
@@ -187,6 +192,16 @@ Client                     Parent (API/Worker)          Enclave                S
 | M4.3 | As a developer, I can run a demo script that submits sample docs as different tenants and shows end-to-end results | M    |
 | M4.4 | As a developer, I can verify the enclave container cannot reach external services        | S    |
 
+### M5: Blockchain Anchoring
+
+| ID   | Story                                                                                   | Size |
+|------|-----------------------------------------------------------------------------------------|------|
+| M5.1 | As the system, after processing completes I compute keccak-256 hashes of encrypted content and results | S    |
+| M5.2 | As the system, I deploy a DocumentRegistry Solidity contract to a local Ganache chain   | S    |
+| M5.3 | As the system, I anchor document hashes on-chain and store the tx_hash in PostgreSQL    | M    |
+| M5.4 | As a client, I can verify a document's on-chain anchor matches the hashes I received    | S    |
+| M5.5 | As a developer, the API response includes content_hash, result_hash, and tx_hash fields | S    |
+
 ---
 
 ## Risks
@@ -197,6 +212,8 @@ Client                     Parent (API/Worker)          Enclave                S
 | Enclave can't access Celery broker    | Medium | Parent Celery task makes synchronous mTLS call to enclave server   |
 | Crypto implementation correctness     | Low    | Use `cryptography` library, not hand-rolled crypto                 |
 | Docker internal network debugging     | Low    | Build a health-check endpoint in enclave; verify isolation early   |
+| Ganache chain reset on restart        | Low    | Contract auto-deploys; production would use persistent chain       |
+| Gas costs on public chains            | Medium | Use L2 (Base, Arbitrum) for low-cost anchoring in production       |
 
 ---
 
@@ -205,14 +222,18 @@ Client                     Parent (API/Worker)          Enclave                S
 ```
 legaldocs/
 ├── docker-compose.yml
+├── contracts/
+│   ├── DocumentRegistry.sol  # Solidity contract for hash anchoring
+│   └── DocumentRegistry.json # Pre-compiled ABI + bytecode
 ├── parent/
 │   ├── Dockerfile
+│   ├── blockchain.py         # Web3.py integration
 │   ├── api/                  # FastAPI application
 │   │   ├── main.py           # API endpoints
 │   │   └── schemas.py        # Pydantic models
 │   ├── workers/              # Celery tasks
 │   │   ├── celery_app.py     # Celery configuration
-│   │   └── tasks.py          # Pipeline tasks (ingest, forward, store)
+│   │   └── tasks.py          # Pipeline tasks (ingest, forward, store, anchor)
 │   ├── models/               # SQLAlchemy models
 │   │   └── models.py         # Document, ExtractedField tables
 │   └── requirements.txt
@@ -227,8 +248,8 @@ legaldocs/
 │   └── requirements.txt
 ├── scripts/
 │   ├── generate_certs.sh     # Generate mTLS certificates
-│   ├── demo.sh               # End-to-end demo
-│   └── verify_privacy.sh     # Prove parent can't see plaintext
+│   ├── demo.py               # End-to-end demo
+│   └── verify_privacy.py     # Prove parent can't see plaintext
 ├── alembic/                  # DB migrations
 │   └── ...
 └── certs/                    # mTLS certificates (gitignored)
@@ -238,14 +259,9 @@ legaldocs/
 
 ## Next Steps
 
-The project plan is complete. To start implementation:
+Milestones M0–M5 are implemented. Recommended areas for further development:
 
-1. **Pick milestone M0** to start with
-2. **For each epic/story**, use the workflow:
-   - `/research` — investigate implementation details
-   - `/plan` — create detailed implementation plan for the milestone
-   - `/implement` — build it
-
-Recommended order: **M0 → M1 → M2 → M3 → M4**
-
-Encryption (M1) comes before the pipeline (M2) intentionally — the parent should never handle plaintext at any point during development.
+- **Production chain deployment**: Replace Ganache with a testnet (Sepolia) or L2 (Base, Arbitrum)
+- **IPFS integration**: Store encrypted documents on IPFS, anchor CIDs on-chain
+- **ZK proofs**: Generate zero-knowledge proofs of correct extraction without revealing content
+- **Token-gated access**: Use ERC-721 or ERC-1155 for document access control

@@ -1,8 +1,10 @@
-# LegalDocs: Privacy-Preserving Legal Document Processing Pipeline
+# LegalDocs: Privacy-Preserving Legal Document Processing with Blockchain Anchoring
 
-A locally runnable MVP that demonstrates how production-grade, privacy-preserving document processing works using [AWS Nitro Enclave](https://aws.amazon.com/ec2/nitro/nitro-enclaves/) patterns — without requiring AWS.
+A locally runnable MVP that demonstrates privacy-preserving document processing using [AWS Nitro Enclave](https://aws.amazon.com/ec2/nitro/nitro-enclaves/) patterns with **Ethereum blockchain anchoring** for tamper-proof audit trails — all without requiring AWS or a public chain.
 
-The core guarantee: **the API server never sees your documents in plaintext**. Documents are encrypted client-side before upload. Only a network-isolated enclave container can decrypt and process them.
+The core guarantees:
+- **The API server never sees your documents in plaintext.** Documents are encrypted client-side before upload. Only a network-isolated enclave container can decrypt and process them.
+- **Every processed document is anchored on-chain.** Keccak-256 hashes of encrypted content and results are recorded in a Solidity smart contract, creating an immutable, verifiable audit trail.
 
 ## Architecture
 
@@ -23,10 +25,13 @@ The core guarantee: **the API server never sees your documents in plaintext**. D
 │    results    │      │         │                    │  No internet        │  │
 │ 6. Decrypt    │      │   external-net              │  tmpfs only         │  │
 │    locally    │      │         │                    │  read-only root     │  │
-└──────────────┘      │  ┌──────┴───────┐           └─────────────────────┘  │
-                       │  │  PostgreSQL  │             enclave-net (internal) │
-                       │  │  Redis       │                                    │
-                       │  └──────────────┘                                    │
+│ 7. Verify     │      │  ┌──────┴───────┐           └─────────────────────┘  │
+│    on-chain   │      │  │  PostgreSQL  │                                    │
+│    hash       │      │  │  Redis       │           ┌─────────────────────┐  │
+└──────────────┘      │  │  Ganache     │           │  Ethereum (local)   │  │
+                       │  └──────────────┘           │  DocumentRegistry   │  │
+                       │                              │  smart contract     │  │
+                       │                              └─────────────────────┘  │
                        └──────────────────────────────────────────────────────┘
 ```
 
@@ -41,6 +46,7 @@ The core guarantee: **the API server never sees your documents in plaintext**. D
 | AWS KMS | Enclave-side key management |
 | RDS PostgreSQL | PostgreSQL container |
 | SQS / Celery on SQS | Redis + Celery |
+| Ethereum L1/L2 | Ganache local chain |
 
 ### Privacy Guarantees
 
@@ -50,6 +56,7 @@ The core guarantee: **the API server never sees your documents in plaintext**. D
 | Parent (API/Worker) | **No** | Only handles ciphertext |
 | PostgreSQL | **No** | Stores encrypted blobs only |
 | Redis | **No** | Task queue has doc IDs, not content |
+| Blockchain | **No** | Only stores keccak-256 hashes |
 | Enclave | Yes | Decrypts in isolated memory |
 | Developer with host access | **No** | Can't read enclave memory or get keys |
 
@@ -67,10 +74,10 @@ The core guarantee: **the API server never sees your documents in plaintext**. D
 # 1. Generate mTLS certificates
 bash scripts/generate_certs.sh
 
-# 2. Start all services
+# 2. Start all services (including local Ethereum via Ganache)
 docker compose up -d
 
-# 3. Run the demo (submits docs as two tenants, shows extraction results)
+# 3. Run the demo (submits docs as two tenants, shows extraction results + tx hashes)
 pip install cryptography requests
 python scripts/demo.py
 
@@ -94,7 +101,19 @@ docker compose down
 6. **Celery worker** forwards the ciphertext to the enclave over mTLS
 7. **Enclave decrypts**, extracts parties and dates via regex, encrypts results
 8. **Worker stores** encrypted results in PostgreSQL
-9. **Client retrieves** encrypted results via `GET /documents/{id}` and decrypts locally
+9. **Worker anchors** keccak-256 hashes of content + results on the DocumentRegistry smart contract
+10. **Client retrieves** encrypted results via `GET /documents/{id}` and decrypts locally
+11. **Client can verify** the on-chain anchor matches the document hashes
+
+### Blockchain Anchoring
+
+After processing completes, the pipeline computes keccak-256 hashes of the encrypted content and encrypted results, then calls `DocumentRegistry.anchorDocument()` on the local Ethereum chain. This creates an immutable record that:
+
+- Proves the document existed at a specific time
+- Proves the processing results haven't been tampered with
+- Links content hash, result hash, tenant, and timestamp in a single on-chain record
+
+The `DocumentRegistry` contract auto-deploys on first use. The transaction hash is stored in the `documents` table alongside the content/result hashes.
 
 ### Encryption
 
@@ -110,16 +129,21 @@ All document endpoints require an `X-Tenant-ID` header. Tenant A cannot see, lis
 
 ```
 legaldocs/
-├── docker-compose.yml          # All services: postgres, redis, api, worker, enclave
+├── docker-compose.yml          # All services: postgres, redis, ganache, api, worker, enclave
+├── contracts/
+│   ├── DocumentRegistry.sol    # Solidity smart contract for hash anchoring
+│   ├── DocumentRegistry.json   # Pre-compiled ABI + bytecode
+│   └── compile.py              # Optional: recompile with solc
 ├── parent/
 │   ├── Dockerfile              # Shared image for API + worker
+│   ├── blockchain.py           # Web3.py integration with DocumentRegistry
 │   ├── api/
 │   │   ├── main.py             # FastAPI endpoints
 │   │   ├── schemas.py          # Pydantic models
 │   │   └── dependencies.py     # Tenant extraction, DB session
 │   ├── workers/
 │   │   ├── celery_app.py       # Celery configuration
-│   │   └── tasks.py            # Pipeline: ingest → forward → store
+│   │   └── tasks.py            # Pipeline: ingest → forward → store → anchor
 │   ├── models/models.py        # SQLAlchemy ORM (Document, ExtractedField)
 │   ├── db.py                   # Database connection
 │   └── logging_config.py       # Structured JSON logging
@@ -135,7 +159,7 @@ legaldocs/
 │   ├── generate_certs.sh       # mTLS certificate generation
 │   ├── demo.py                 # Multi-tenant demo
 │   └── verify_privacy.py       # Privacy proof script
-└── docs/dev/                   # Design docs per milestone
+└── docs/                       # Additional documentation
 ```
 
 ## API Endpoints
@@ -146,13 +170,29 @@ legaldocs/
 | `GET` | `/attestation` | None | Proxy enclave attestation (public key + signature) |
 | `POST` | `/documents` | `X-Tenant-ID` | Submit encrypted document for processing |
 | `GET` | `/documents` | `X-Tenant-ID` | List tenant's documents (optional `?status=` filter) |
-| `GET` | `/documents/{id}` | `X-Tenant-ID` | Get document status and encrypted results |
+| `GET` | `/documents/{id}` | `X-Tenant-ID` | Get document status, encrypted results, and tx_hash |
 | `POST` | `/decrypt` | None | Proxy decryption request to enclave |
+
+### Response Fields (Document)
+
+```json
+{
+  "id": "uuid",
+  "status": "COMPLETED",
+  "encrypted_result": "base64...",
+  "content_hash": "0x...",
+  "result_hash": "0x...",
+  "tx_hash": "0x...",
+  "created_at": "2026-04-13T...",
+  "updated_at": "2026-04-13T..."
+}
+```
 
 ## Tech Stack
 
 - **Python 3.12**, **FastAPI**, **Celery**, **SQLAlchemy**, **Alembic**
 - **PostgreSQL 16**, **Redis 7**
+- **Solidity 0.8.20**, **Web3.py**, **Ganache** (local Ethereum)
 - **Docker Compose** with internal network isolation
 - **cryptography** library for RSA/AES operations
 - **mTLS** for parent-enclave communication
