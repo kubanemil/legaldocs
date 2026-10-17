@@ -66,10 +66,14 @@ def _relayer() -> Relayer:
     return Relayer(w3, settings.registry_address, settings.relayer_key, nonce_lock)
 
 
+# Celery logs and swallows exceptions from signal handlers; SystemExit is not swallowed.
 @worker_init.connect
 def check_configuration(**_: object) -> None:
-    _settings()
-    _relayer()
+    try:
+        _settings()
+        _relayer()
+    except (KeyError, ValueError, ChainError, Web3Exception, OSError) as exc:
+        raise SystemExit(f"worker is misconfigured: {exc!r}") from exc
 
 
 @app.task(bind=True, max_retries=5)
