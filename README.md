@@ -1,198 +1,192 @@
-# LegalDocs: Privacy-Preserving Legal Document Processing with Blockchain Anchoring
+# legaldocs
 
-A locally runnable MVP that demonstrates privacy-preserving document processing using [AWS Nitro Enclave](https://aws.amazon.com/ec2/nitro/nitro-enclaves/) patterns with **Ethereum blockchain anchoring** for tamper-proof audit trails — all without requiring AWS or a public chain.
+legaldocs pulls parties and dates out of legal documents while the server that stores and
+queues them cannot read them. Before sending anything, the client checks an attestation of the
+enclave's code. It then seals each document to a key only that enclave holds, and gets the
+result back sealed to a key it made for that one request. The enclave signs a receipt for every
+document, and the receipt's hash is timestamped on Ethereum. Everything runs on one machine
+with Docker: a container stands in for the AWS Nitro enclave, and a mock security module stands
+in for Nitro's hardware attestation.
 
-The core guarantees:
-- **The API server never sees your documents in plaintext.** Documents are encrypted client-side before upload. Only a network-isolated enclave container can decrypt and process them.
-- **Every processed document is anchored on-chain.** Keccak-256 hashes of encrypted content and results are recorded in a Solidity smart contract, creating an immutable, verifiable audit trail.
+## Threat model
+
+The adversary is the parent: the API, the worker, Postgres and Redis. It can read and change
+everything it stores, replay and reorder messages, and run any code in its own containers.
+
+What the simulation guarantees against it:
+
+- The parent never holds a key that opens a document or a result. Documents are sealed to the
+  enclave's key. Results are sealed to a key the client made for that request, and that key
+  travels inside the sealed document, so the parent cannot swap in its own.
+- The parent cannot pass off its own key as the enclave's. Only the mock NSM can sign an
+  attestation. Its key lives in a container with no network, and the parent can reach neither
+  that key nor the socket the enclave uses to ask for signatures.
+- A recorded attestation cannot be replayed and a different enclave build is refused. Every
+  attestation carries the client's nonce, PCR0 and a timestamp, and the client checks all three.
+- Every ciphertext is bound to its tenant, its document id and the protocol version. A
+  document moved to another tenant, or a result swapped between documents, fails to decrypt.
+- A receipt commits to the input and the output under a salt only the client knows. It proves
+  what was processed, and neither the receipt nor its on-chain hash lets anyone confirm a
+  guessed document.
+
+What it does not guarantee:
+
+- Memory isolation. The enclave is an ordinary container, so root on the host can read its
+  memory, swap its image or run a different NSM. A Nitro enclave closes that door. This repo
+  shows the protocol, not the isolation.
+- A hardware root of trust. The NSM is software that makes its root key at boot, and the client
+  copies the root certificate off the host (`./do dev` does it). With Nitro, the root is AWS's,
+  pinned once.
+- Code identity of the running bytes. PCR0 here hashes the enclave's build inputs: a Dockerfile
+  with a digest-pinned base, hash-locked requirements and the source. The NSM measures a copy of
+  those inputs baked into its own image, so a host that builds the two images from different
+  trees defeats the check.
+- Availability. The parent can drop, delay or refuse any request.
+
+The enclave does see plaintext, since that is its job. Its logs leave the enclave, so they
+carry request lines and error types, never document content.
 
 ## Architecture
 
 ```
-┌──────────────┐      ┌──────────────────────────────────────────────────────┐
-│    Client     │      │               docker compose                         │
-│               │      │                                                      │
-│ 1. Request    │      │  ┌──────────────┐           ┌─────────────────────┐  │
-│    attestation│─────>│  │    Parent     │   mTLS    │  Enclave Container  │  │
-│ 2. Verify it  │<─────│  │   (FastAPI +  │<────────>│                     │  │
-│ 3. Encrypt    │      │  │    Celery     │  vsock    │  - Holds private    │  │
-│    doc locally│      │  │    worker)    │  (simul.) │    key              │  │
-│ 4. Send       │      │  │              │           │  - Decrypts docs    │  │
-│    ciphertext │─────>│  │  ONLY sees   │           │  - Extracts fields  │  │
-│               │      │  │  encrypted   │           │  - Encrypts results │  │
-│ 5. Receive    │<─────│  │  blobs       │           │                     │  │
-│    encrypted  │      │  └──────┬───────┘           │  No DB access       │  │
-│    results    │      │         │                    │  No internet        │  │
-│ 6. Decrypt    │      │   external-net              │  tmpfs only         │  │
-│    locally    │      │         │                    │  read-only root     │  │
-│ 7. Verify     │      │  ┌──────┴───────┐           └─────────────────────┘  │
-│    on-chain   │      │  │  PostgreSQL  │                                    │
-│    hash       │      │  │  Redis       │           ┌─────────────────────┐  │
-└──────────────┘      │  │  Ganache     │           │  Ethereum (local)   │  │
-                       │  └──────────────┘           │  DocumentRegistry   │  │
-                       │                              │  smart contract     │  │
-                       │                              └─────────────────────┘  │
-                       └──────────────────────────────────────────────────────┘
+client SDK ──HTTPS + API key──▶ api ─────┬── postgres  ciphertext, receipts, hashed API keys
+(plaintext lives here)                   ├── redis     task ids only
+                               worker ───┴── anvil     ReceiptRegistry: receipt hashes
+                                 │
+                   mTLS on an internal network (api, worker, enclave only),
+                   enclave certificate pinned by attestation
+                                 │
+                              enclave ──Unix socket──▶ mock NSM
+                   keys made at boot, read-only,       no network; the only key
+                   no host volumes but the parent CA   that signs attestations
 ```
 
-### How It Maps to AWS Production
+A request, with the attestation handshake first:
 
-| AWS Production | Local MVP |
-|---|---|
-| EC2 Parent Instance | Parent container (FastAPI + Celery) |
-| Nitro Enclave VM | Docker container on internal-only network |
-| vsock channel | mTLS over Docker internal network |
-| Nitro Attestation (hardware) | Simulated attestation (signed cert + metadata) |
-| AWS KMS | Enclave-side key management |
-| RDS PostgreSQL | PostgreSQL container |
-| SQS / Celery on SQS | Redis + Celery |
-| Ethereum L1/L2 | Ganache local chain |
+1. The client sends a fresh 32-byte nonce to `GET /attestation`. The parent passes it to the
+   enclave, which asks the NSM for a document carrying the nonce, the enclave's encryption key,
+   its receipt-signing key and the hash of its TLS certificate. The NSM adds the PCRs it
+   measured and signs the document with ES384.
+2. The client checks the certificate chain up to the NSM root it pinned, the signature, the
+   nonce, PCR0 and that the document is under five minutes old. Nothing leaves the client
+   before this passes.
+3. The client makes a one-off X25519 key pair and a random salt, then seals
+   `{document, reply key, salt}` to the attested key with HPKE. Tenant, document id and
+   version go into the HPKE context, so they are authenticated but not secret.
+4. `POST /documents` stores the envelope. Only the ids go through Redis.
+5. The worker sends the envelope to the enclave. The enclave opens it, extracts the fields,
+   seals the result to the reply key and signs a receipt: binding hash, salted input and output
+   hashes, PCR0 and time.
+6. The worker stores both and anchors SHA-256 of the receipt on `ReceiptRegistry`.
+7. The client opens the result, checks the receipt against what it sent, and can read the
+   anchor's timestamp straight from the chain.
 
-### Privacy Guarantees
+The parent reaches the enclave the same way. The enclave's TLS certificate is self-signed, and
+the parent trusts it only after a fresh attestation binds its hash to the expected PCR0.
 
-| Component | Sees plaintext? | Why |
+| Method | Path | Returns |
 |---|---|---|
-| Client | Yes | It's their document |
-| Parent (API/Worker) | **No** | Only handles ciphertext |
-| PostgreSQL | **No** | Stores encrypted blobs only |
-| Redis | **No** | Task queue has doc IDs, not content |
-| Blockchain | **No** | Only stores keccak-256 hashes |
-| Enclave | Yes | Decrypts in isolated memory |
-| Developer with host access | **No** | Can't read enclave memory or get keys |
+| `GET` | `/attestation?nonce=` | the enclave's attestation document |
+| `POST` | `/documents` | `202`, after storing a sealed envelope under a client-chosen id |
+| `GET` | `/documents`, `/documents/{id}` | status, sealed result, receipt, anchor tx |
+| `GET` | `/tenant` | the tenant the API key belongs to |
+| `GET` | `/health` | liveness, no auth |
 
-## Quick Start
+Every route but `/health` takes `Authorization: Bearer <api key>`. There is no way to ask the
+parent to decrypt anything.
 
-### Prerequisites
+### Key lifetime
 
-- Docker and Docker Compose v2+
-- Python 3.12+
-- `openssl` CLI
+The enclave makes its keys at boot and never writes them anywhere, so a restart re-keys.
+Documents sealed to the old key can no longer be opened. The worker marks them `FAILED` with
+`enclave_key_rotated`, and the SDK's `process()` re-attests and resubmits once. A restart costs
+the documents in flight. In return there is no sealed key on disk to steal and no key-release
+service to trust. Milestone 2 removes the cost with KMS.
 
-### Run
-
-```bash
-# 1. Generate mTLS certificates
-bash scripts/generate_certs.sh
-
-# 2. Start all services (including local Ethereum via Ganache)
-docker compose up -d
-
-# 3. Run the demo (submits docs as two tenants, shows extraction results + tx hashes)
-pip install cryptography requests
-python scripts/demo.py
-
-# 4. Verify privacy (proves parent never sees plaintext)
-pip install psycopg2-binary
-python scripts/verify_privacy.py
-
-# 5. Stop
-docker compose down
-```
-
-## How It Works
-
-### Data Flow
-
-1. **Client requests attestation** from the enclave (via API proxy)
-2. **Client verifies** the attestation signature against the CA certificate
-3. **Client encrypts** the document using the enclave's public key (RSA-OAEP + AES-256-GCM envelope encryption)
-4. **Client submits** the ciphertext to `POST /documents`
-5. **API stores** the encrypted blob in PostgreSQL, queues a Celery task
-6. **Celery worker** forwards the ciphertext to the enclave over mTLS
-7. **Enclave decrypts**, extracts parties and dates via regex, encrypts results
-8. **Worker stores** encrypted results in PostgreSQL
-9. **Worker anchors** keccak-256 hashes of content + results on the DocumentRegistry smart contract
-10. **Client retrieves** encrypted results via `GET /documents/{id}` and decrypts locally
-11. **Client can verify** the on-chain anchor matches the document hashes
-
-### Blockchain Anchoring
-
-After processing completes, the pipeline computes keccak-256 hashes of the encrypted content and encrypted results, then calls `DocumentRegistry.anchorDocument()` on the local Ethereum chain. This creates an immutable record that:
-
-- Proves the document existed at a specific time
-- Proves the processing results haven't been tampered with
-- Links content hash, result hash, tenant, and timestamp in a single on-chain record
-
-The `DocumentRegistry` contract auto-deploys on first use. The transaction hash is stored in the `documents` table alongside the content/result hashes.
-
-### Encryption
-
-- **Envelope encryption**: RSA-2048 OAEP wraps a random AES-256-GCM data encryption key
-- **Wire format**: `[4B DEK length][encrypted DEK][12B nonce][AES-GCM ciphertext + tag]`
-- **Attestation**: Enclave signs its public key + metadata with its mTLS private key; client verifies against CA
-
-### Tenant Isolation
-
-All document endpoints require an `X-Tenant-ID` header. Tenant A cannot see, list, or retrieve tenant B's documents (returns 404, not 403, to avoid leaking existence).
-
-## Project Structure
+## Layout
 
 ```
-legaldocs/
-├── docker-compose.yml          # All services: postgres, redis, ganache, api, worker, enclave
-├── contracts/
-│   ├── DocumentRegistry.sol    # Solidity smart contract for hash anchoring
-│   ├── DocumentRegistry.json   # Pre-compiled ABI + bytecode
-│   └── compile.py              # Optional: recompile with solc
-├── parent/
-│   ├── Dockerfile              # Shared image for API + worker
-│   ├── blockchain.py           # Web3.py integration with DocumentRegistry
-│   ├── api/
-│   │   ├── main.py             # FastAPI endpoints
-│   │   ├── schemas.py          # Pydantic models
-│   │   └── dependencies.py     # Tenant extraction, DB session
-│   ├── workers/
-│   │   ├── celery_app.py       # Celery configuration
-│   │   └── tasks.py            # Pipeline: ingest → forward → store → anchor
-│   ├── models/models.py        # SQLAlchemy ORM (Document, ExtractedField)
-│   ├── db.py                   # Database connection
-│   └── logging_config.py       # Structured JSON logging
-├── enclave/
-│   ├── Dockerfile              # Minimal isolated image
-│   ├── server.py               # mTLS server (/health, /attestation, /process, /decrypt)
-│   ├── crypto.py               # RSA/AES envelope encryption
-│   └── extractor.py            # Regex extraction (parties, dates)
-├── client/
-│   └── client.py               # SDK: encrypt, submit, poll, decrypt
-├── alembic/                    # Database migrations
-├── scripts/
-│   ├── generate_certs.sh       # mTLS certificate generation
-│   ├── demo.py                 # Multi-tenant demo
-│   └── verify_privacy.py       # Privacy proof script
-└── docs/                       # Additional documentation
+protocol/    wire formats every party shares: HPKE envelopes, COSE_Sign1, attestation, receipts
+nsm/         mock Nitro Security Module: measures the enclave, signs attestations
+enclave/     the enclave: boot-time keys, attested TLS, bounded HTTPS server, extraction
+parent/      API, Celery worker, attested enclave link, chain relayer, admin CLI
+client/      SDK: attest, seal, submit, open, verify
+contracts/   ReceiptRegistry and its Foundry tests
+alembic/     database migrations
+scripts/     parent certificates, demo, contract artifact export
+tests/       unit tests without Docker; tests/smoke runs against the compose stack
 ```
 
-## API Endpoints
+## Development
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/health` | None | Service health check |
-| `GET` | `/attestation` | None | Proxy enclave attestation (public key + signature) |
-| `POST` | `/documents` | `X-Tenant-ID` | Submit encrypted document for processing |
-| `GET` | `/documents` | `X-Tenant-ID` | List tenant's documents (optional `?status=` filter) |
-| `GET` | `/documents/{id}` | `X-Tenant-ID` | Get document status, encrypted results, and tx_hash |
-| `POST` | `/decrypt` | None | Proxy decryption request to enclave |
+You need Docker with Compose, [uv](https://docs.astral.sh/uv/) and
+[Foundry](https://getfoundry.sh).
 
-### Response Fields (Document)
-
-```json
-{
-  "id": "uuid",
-  "status": "COMPLETED",
-  "encrypted_result": "base64...",
-  "content_hash": "0x...",
-  "result_hash": "0x...",
-  "tx_hash": "0x...",
-  "created_at": "2026-04-13T...",
-  "updated_at": "2026-04-13T..."
-}
+```
+./do test     # unit tests and Foundry tests, no Docker
+./do check    # ruff, mypy, forge fmt, lockfile, image requirements, contract artifact
+./do dev      # issue certs if needed, measure the enclave, build and start the stack
+./do demo     # two tenants run three contracts through the running stack
+./do smoke    # fresh stack, end-to-end and privacy checks, teardown
+./do down     # stop the stack and delete its volumes
 ```
 
-## Tech Stack
+`./do smoke` fails if a test document shows up in a Postgres dump, an uncompressed Redis
+dump or any container log, if the enclave can reach the internet, Postgres, Redis, anvil or
+the NSM over the network, or if a host key reaches the enclave. CI runs it on every pull
+request.
 
-- **Python 3.12**, **FastAPI**, **Celery**, **SQLAlchemy**, **Alembic**
-- **PostgreSQL 16**, **Redis 7**
-- **Solidity 0.8.20**, **Web3.py**, **Ganache** (local Ethereum)
-- **Docker Compose** with internal network isolation
-- **cryptography** library for RSA/AES operations
-- **mTLS** for parent-enclave communication
+`./do key NAME` creates a tenant on the running stack and prints an API key. `./do pcr0` prints
+the PCR0 a client should expect from this checkout.
+
+## Configuration
+
+The parent (api and worker) reads:
+
+| Variable | Meaning |
+|---|---|
+| `DATABASE_URL`, `REDIS_URL` | Postgres and Redis |
+| `ENCLAVE_HOST`, `ENCLAVE_PORT` | where the enclave listens |
+| `PARENT_CERT`, `PARENT_KEY` | the parent's mTLS identity, from `./do certs` |
+| `NSM_TRUST_ANCHOR` | the NSM root certificate |
+| `EXPECTED_PCR0` | the enclave build the parent will talk to; `./do dev` sets it |
+| `ETH_RPC_URL`, `REGISTRY_ADDRESS` | the chain and the one registry to use |
+| `RELAYER_KEY` | worker only: the key allowed to anchor |
+| `MAX_ENVELOPE_BYTES` | largest accepted envelope, 4 MiB by default |
+
+The enclave reads `PARENT_CA`, `NSM_SOCKET`, `PORT`, `MAX_CONNECTIONS` and `MAX_BODY_BYTES`.
+The NSM reads `NSM_SOCKET`, `NSM_TRUST_ANCHOR` and `NSM_MEASURED_DIR`. `./do` publishes the API
+on `API_PORT` (8000) and anvil on `ANVIL_PORT` (8545).
+
+The compose file uses anvil's public development keys. The registry is deployed once by the
+`deploy` service to a fixed address; workers refuse to start if nothing is deployed there.
+
+## Decisions
+
+| Choice | Not chosen | Why |
+|---|---|---|
+| HPKE (RFC 9180) from `cryptography`: X25519, HKDF-SHA256, AES-256-GCM | pyhpke; X25519 + HKDF + AES-GCM by hand | `cryptography` 50 ships HPKE, so there is no extra dependency and no hand-assembled scheme. Its API is single-shot and takes `info` only. The binding goes there, which authenticates it exactly as AAD would in single-shot mode. |
+| Nitro's attestation format: COSE_Sign1, ES384, the same CBOR fields | A custom signed JSON blob | The verifier runs unchanged on real NSM documents. Milestone 2 swaps the trust anchor and the NSM client, nothing else. |
+| COSE_Sign1 framed with `cbor2`, signed with `cryptography` | pycose | Sign1 is a four-element CBOR array. pycose would add `ecdsa` and `attrs` for that. |
+| NSM in its own container, no network, socket shared only with the enclave | NSM inside the enclave container | The attestation key stays away from both the enclave and the parent, as with the hypervisor. |
+| Attested TLS: the enclave self-signs, the parent pins what the attestation binds | An enclave CA on the host | Any CA key on the host lets the parent mint an enclave certificate. |
+| Parent CA used once for a 7-day `clientAuth` leaf, then discarded | A long-lived CA with revocation lists | Nothing on disk can mint another parent certificate. Short lifetime stands in for revocation. |
+| Re-key on restart with a defined failure | Sealing the key to disk | See [Key lifetime](#key-lifetime). |
+| Per-tenant API keys, stored as SHA-256 of a 256-bit secret | JWTs; bcrypt or argon2 | Opaque keys revoke instantly and need no signing key. Slow hashes protect guessable passwords, and these secrets are random. |
+| `(tenant_id, id)` as the document primary key | Global document ids | Every lookup needs the tenant, and a tenant cannot learn that another used an id. |
+| Only the receipt hash on chain | Document id or tenant id on chain | The hash reveals nothing, and keying by it makes anchoring idempotent. |
+| Redis lock around a `pending` nonce | One worker per relayer key | Any number of workers can anchor. A transaction lost after sending is safe to resend. |
+| stdlib `ThreadingHTTPServer` in the enclave, with a connection cap and read deadlines | uvicorn | Less code inside the measurement for two endpoints. |
+| PCR0 over build inputs | A hash of the Docker image | Image digests change between identical builds. The inputs reproduce from any checkout. |
+| anvil | Ganache | Ganache is retired, and anvil ships with the Foundry toolchain the contract tests use. |
+
+## Roadmap: milestone 2
+
+- Build a real Nitro EIF with `nitro-cli build-enclave`, record its PCRs with each release, and
+  have clients pin those.
+- Release the document key from KMS under a key policy on `kms:RecipientAttestation:PCR0`, so a
+  restarted enclave gets the same key and `enclave_key_rotated` goes away.
+- Replace the internal Docker network with a vsock proxy between parent and enclave.
+- Read attestations from `/dev/nsm` and pin the AWS Nitro root instead of the mock's.
+- Batch receipt hashes into a Merkle transparency log and anchor one root per batch, with
+  inclusion proofs for clients.
