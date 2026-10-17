@@ -68,31 +68,34 @@ class AttestedTlsLink:
         return ProcessResponse.decode(self._request("POST", "/process", request.encode()))
 
     def _request(self, method: str, path: str, body: bytes | None = None) -> bytes:
-        for attempt in range(2):
-            context = self._context()
+        context = self._context()
+        try:
+            status, payload, _ = self._send(context, method, path, body)
+        except ssl.SSLCertVerificationError:
+            self._forget(context)
             try:
-                status, payload = self._send(context, method, path, body)
+                status, payload, _ = self._send(self._context(), method, path, body)
             except ssl.SSLCertVerificationError as exc:
-                self._forget(context)
-                if attempt:
-                    raise EnclaveUnavailable("enclave certificate changed twice in a row") from exc
-                continue
-            except (OSError, http.client.HTTPException) as exc:
-                raise EnclaveUnavailable(f"cannot reach the enclave: {type(exc).__name__}") from exc
-            if status != 200:
-                raise EnclaveRejected(_error_code(payload), status)
-            return payload
-        raise AssertionError("unreachable")
+                raise EnclaveUnavailable("enclave certificate is not the attested one") from exc
+        if status != 200:
+            raise EnclaveRejected(_error_code(payload), status)
+        return payload
 
     def _send(
         self, context: ssl.SSLContext, method: str, path: str, body: bytes | None
-    ) -> tuple[int, bytes]:
+    ) -> tuple[int, bytes, bytes]:
         connection = _Connection(self._host, self._port, context, self._timeout)
         try:
+            connection.connect()
+            peer = connection.sock.getpeercert(binary_form=True) or b""
             headers = {"Content-Type": "application/cbor"} if body is not None else {}
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
-            return response.status, response.read()
+            return response.status, response.read(), peer
+        except ssl.SSLCertVerificationError:
+            raise
+        except (OSError, http.client.HTTPException) as exc:
+            raise EnclaveUnavailable(f"cannot reach the enclave: {type(exc).__name__}") from exc
         finally:
             connection.close()
 
@@ -112,18 +115,8 @@ class AttestedTlsLink:
         probe.check_hostname = False
         probe.verify_mode = ssl.CERT_NONE
         nonce = os.urandom(32)
-        connection = _Connection(self._host, self._port, probe, self._timeout)
-        try:
-            connection.connect()
-            peer = connection.sock.getpeercert(binary_form=True)
-            connection.request("GET", f"/attestation?nonce={nonce.hex()}")
-            response = connection.getresponse()
-            document = response.read()
-        except (OSError, http.client.HTTPException) as exc:
-            raise EnclaveUnavailable(f"cannot reach the enclave: {type(exc).__name__}") from exc
-        finally:
-            connection.close()
-        if response.status != 200 or not peer:
+        status, document, peer = self._send(probe, "GET", f"/attestation?nonce={nonce.hex()}", None)
+        if status != 200 or not peer:
             raise EnclaveUnavailable("enclave did not return an attestation")
 
         policy = Policy.from_pem(self._trust_anchor.read_bytes(), self._expected_pcr0)

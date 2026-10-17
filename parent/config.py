@@ -39,5 +39,5 @@ class Settings:
             eth_rpc_url=env.get("ETH_RPC_URL", ""),
             registry_address=env.get("REGISTRY_ADDRESS", ""),
             relayer_key=env.get("RELAYER_KEY", ""),
-            max_envelope_bytes=int(env.get("MAX_ENVELOPE_BYTES", str(8 * 1024 * 1024))),
+            max_envelope_bytes=int(env.get("MAX_ENVELOPE_BYTES", str(4 * 1024 * 1024))),
         )

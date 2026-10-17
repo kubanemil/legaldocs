@@ -6,6 +6,7 @@ from uuid import UUID
 
 from protocol import cbor
 from protocol.envelope import Binding
+from protocol.receipt import SALT_BYTES
 
 X25519_KEY_BYTES: Final = 32
 
@@ -31,7 +32,7 @@ class DocumentRequest:
             reply_key=cbor.field(fields, "reply_key", bytes),
             salt=cbor.field(fields, "salt", bytes),
         )
-        if len(request.reply_key) != X25519_KEY_BYTES or len(request.salt) != 32:
+        if len(request.reply_key) != X25519_KEY_BYTES or len(request.salt) != SALT_BYTES:
             raise cbor.DecodeError("bad reply key or salt length")
         return request
 

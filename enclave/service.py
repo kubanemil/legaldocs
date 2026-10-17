@@ -31,14 +31,10 @@ log = logging.getLogger("enclave")
 class EnclaveError(Exception):
     """A failure the enclave reports to its caller as a fixed code and nothing more."""
 
-    def __init__(self, code: str, status: int) -> None:
+    def __init__(self, code: str, status: int = 400) -> None:
         super().__init__(code)
         self.code = code
         self.status = status
-
-
-BAD_REQUEST: Final = ("bad_request", 400)
-STALE_KEY: Final = ("stale_key", 409)
 
 
 @dataclass(frozen=True)
@@ -73,7 +69,7 @@ class EnclaveService:
 
     def attestation(self, nonce: bytes) -> bytes:
         if not MIN_NONCE_BYTES <= len(nonce) <= MAX_NONCE_BYTES:
-            raise EnclaveError(*BAD_REQUEST)
+            raise EnclaveError("bad_request")
         return self._nsm.attest(public_key=self._public_key, user_data=self._user_data, nonce=nonce)
 
     def process(self, body: bytes) -> bytes:
@@ -85,10 +81,10 @@ class EnclaveService:
             text = document.content.decode("utf-8")
             reply_key = envelope.load_public_key(document.reply_key)
         except envelope.StaleKeyError:
-            raise EnclaveError(*STALE_KEY) from None
+            raise EnclaveError("stale_key", 409) from None
         except ValueError as exc:
             log.info("rejected request: %s", type(exc).__name__)
-            raise EnclaveError(*BAD_REQUEST) from None
+            raise EnclaveError("bad_request") from None
 
         result = json.dumps(extract_fields(text), sort_keys=True, ensure_ascii=False).encode()
         signed = receipt.sign(
