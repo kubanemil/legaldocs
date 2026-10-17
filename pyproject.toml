@@ -1,0 +1,70 @@
+[project]
+name = "legaldocs"
+version = "0.2.0"
+description = "Confidential legal document processing in an attested enclave, with receipts anchored on Ethereum."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "cbor2>=6.1",
+    "cryptography>=50.0",
+]
+
+[dependency-groups]
+client = [
+    "httpx>=0.28",
+]
+parent = [
+    "alembic>=1.20",
+    "celery>=5.6",
+    "fastapi>=0.143",
+    "psycopg[binary]>=3.3",
+    "redis>=8.1",
+    "sqlalchemy>=2.1",
+    "uvicorn>=0.54",
+    "web3>=7.14",
+]
+dev = [
+    "mypy>=2.4",
+    "pytest>=9.1",
+    "ruff>=0.17",
+]
+
+[tool.uv]
+package = false
+default-groups = ["client", "parent", "dev"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["contracts/lib"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PL", "PT"]
+ignore = ["PLR0913", "PLR2004", "S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S603", "S607", "PLR0915"]
+"scripts/**" = ["S603", "S607", "T201"]
+"enclave/server.py" = ["S104"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["protocol", "nsm", "enclave", "parent", "client", "scripts", "tests"]
+exclude = ["contracts/"]
+
+[[tool.mypy.overrides]]
+module = ["celery.*", "kombu.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["parent.worker"]
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "-m", "not smoke"]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient` is deprecated"]
+markers = ["smoke: needs the docker compose stack (./do smoke)"]
