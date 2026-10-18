@@ -82,7 +82,13 @@ A request, with the attestation handshake first:
    anchor's timestamp straight from the chain.
 
 The parent reaches the enclave the same way. The enclave's TLS certificate is self-signed, and
-the parent trusts it only after a fresh attestation binds its hash to the expected PCR0.
+the parent trusts it only after a fresh attestation binds its hash to the expected PCR0. The
+enclave replaces the certificate halfway through its 24-hour life, and the parent re-attests
+when the pinned one stops verifying.
+
+Extraction runs in a small pool of worker processes. A document that takes longer than the
+deadline (10 seconds by default) fails with `processing_timeout`, and its worker is killed and
+replaced, so one tenant cannot hold the enclave for everyone.
 
 | Method | Path | Returns |
 |---|---|---|
@@ -151,15 +157,18 @@ The parent (api and worker) reads:
 | `NSM_TRUST_ANCHOR` | the NSM root certificate |
 | `EXPECTED_PCR0` | the enclave build the parent will talk to; `./do dev` sets it |
 | `ETH_RPC_URL`, `REGISTRY_ADDRESS` | the chain and the one registry to use |
+| `REGISTRY_DEPLOY_BLOCK` | the registry's deploy block; log scans never go below it |
 | `RELAYER_KEY` | worker only: the key allowed to anchor |
 | `MAX_ENVELOPE_BYTES` | largest accepted envelope, 4 MiB by default |
 
-The enclave reads `PARENT_CA`, `NSM_SOCKET`, `PORT`, `MAX_CONNECTIONS` and `MAX_BODY_BYTES`.
+The enclave reads `PARENT_CA`, `NSM_SOCKET`, `PORT`, `MAX_CONNECTIONS`, `MAX_BODY_BYTES`,
+`EXTRACT_WORKERS` (2) and `PROCESS_DEADLINE_SECONDS` (10).
 The NSM reads `NSM_SOCKET`, `NSM_TRUST_ANCHOR` and `NSM_MEASURED_DIR`. `./do` publishes the API
 on `API_PORT` (8000) and anvil on `ANVIL_PORT` (8545).
 
-The compose file uses anvil's public development keys. The registry is deployed once by the
-`deploy` service to a fixed address; workers refuse to start if nothing is deployed there.
+The compose file uses anvil's public development keys. The `deploy` service deploys the
+registry once, and refuses to send the deployment if it would land anywhere but
+`REGISTRY_ADDRESS`. Workers refuse to start if nothing is deployed there.
 
 ## Decisions
 
@@ -177,6 +186,7 @@ The compose file uses anvil's public development keys. The registry is deployed 
 | Only the receipt hash on chain | Document id or tenant id on chain | The hash reveals nothing, and keying by it makes anchoring idempotent. |
 | Redis lock around a `pending` nonce | One worker per relayer key | Any number of workers can anchor. A transaction lost after sending is safe to resend. |
 | stdlib `ThreadingHTTPServer` in the enclave, with a connection cap and read deadlines | uvicorn | Less code inside the measurement for two endpoints. |
+| Extraction in worker processes that are killed at the deadline | A timeout around a thread | A thread cannot be stopped, so its work keeps the CPU after the request gives up. |
 | PCR0 over build inputs | A hash of the Docker image | Image digests change between identical builds. The inputs reproduce from any checkout. |
 | anvil | Ganache | Ganache is retired, and anvil ships with the Foundry toolchain the contract tests use. |
 
