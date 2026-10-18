@@ -50,7 +50,7 @@ This repo shows the protocol, not the isolation:
 - Nothing stops the parent from dropping, delaying or refusing a request.
 
 The enclave does see plaintext, since that is its job. Its logs leave it, so they carry
-request lines and error types only. Its keys never leave its memory, so a restart re-keys:
+request lines and error types, never document content. Its keys never leave its memory, so a restart re-keys:
 documents in flight fail with `enclave_key_rotated`, and the SDK's `process()` re-attests and
 resubmits once.
 
