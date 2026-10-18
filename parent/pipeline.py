@@ -1,8 +1,5 @@
-"""What the worker does with a document. The parent only moves ciphertext and receipts.
-
-Each step ends in one of three outcomes. A document never stays PROCESSING after its last
-attempt: anything that is not a retry or a success leaves it FAILED with a code.
-"""
+"""A document never stays PROCESSING after its last attempt: anything that is not a retry
+or a success leaves it FAILED with a code."""
 
 import logging
 from collections.abc import Callable

@@ -1,5 +1,3 @@
-"""Serves the mock NSM on a Unix socket and publishes its root certificate."""
-
 import logging
 import os
 import socketserver

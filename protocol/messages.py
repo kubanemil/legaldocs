@@ -1,5 +1,3 @@
-"""Messages between the client, the parent and the enclave."""
-
 from dataclasses import dataclass
 from typing import Final
 from uuid import UUID

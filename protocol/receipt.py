@@ -1,8 +1,5 @@
-"""Processing receipts: what the enclave signs after it handles a document.
-
-Commitments are keyed with a salt only the client knows, so a receipt stored by the
-parent, or its hash on chain, cannot be used to confirm a guessed document.
-"""
+"""Commitments are keyed with a salt only the client knows, so a receipt stored by the
+parent, or its hash on chain, cannot be used to confirm a guessed document."""
 
 import hashlib
 import hmac

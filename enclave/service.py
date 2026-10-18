@@ -1,8 +1,5 @@
-"""The enclave's work: attest its keys, open document envelopes, seal results to the client.
-
-Keys are generated at boot and never leave this process. A restart re-keys, and
-envelopes sealed to the old key fail with `stale_key` (see README, "Key lifetime").
-"""
+"""Keys are made at boot and never leave this process, so a restart re-keys and envelopes
+sealed to the old key fail with `stale_key`."""
 
 import json
 import logging
@@ -57,7 +54,6 @@ class EnclaveService:
         self._public_key = envelope.raw_public_key(keys.encryption.public_key())
 
     def attestation(self, nonce: bytes, tls_certificate: bytes) -> bytes:
-        """Attest this enclave's keys and the TLS certificate the caller is connected through."""
         if not MIN_NONCE_BYTES <= len(nonce) <= MAX_NONCE_BYTES:
             raise EnclaveError("bad_request")
         user_data = enclave_user_data(self._keys.signing.public_key(), tls_certificate)

@@ -1,9 +1,5 @@
-"""The parent's channel to the enclave: mutual TLS, with the enclave's certificate pinned
-only after a fresh attestation binds it to the expected PCR0.
-
-The enclave mints its own certificate at boot, so no CA the parent controls can vouch for
-it, and the parent cannot impersonate it to anyone.
-"""
+"""Mutual TLS to the enclave, pinning its self-signed certificate only after a fresh
+attestation binds it to the expected PCR0."""
 
 import hashlib
 import hmac

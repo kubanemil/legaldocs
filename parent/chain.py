@@ -1,9 +1,5 @@
-"""Anchoring receipt hashes on the ReceiptRegistry contract.
-
-Workers never deploy. They talk to the one registry at REGISTRY_ADDRESS, and the deploy
-step (`python -m parent.chain deploy`) refuses to send a deployment that would land
-anywhere else.
-"""
+"""Workers never deploy. They use the one registry at REGISTRY_ADDRESS, and the deploy step
+refuses to send a deployment that would land anywhere else."""
 
 import argparse
 import json

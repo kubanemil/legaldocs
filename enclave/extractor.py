@@ -1,8 +1,4 @@
-"""Regex extraction of parties and dates from legal text.
-
-Every repetition is bounded, so each pattern costs at most a constant per character and a
-hostile document cannot make extraction quadratic.
-"""
+"""Every repetition is bounded, so a hostile document cannot make extraction quadratic."""
 
 import re
 from typing import Any, Final

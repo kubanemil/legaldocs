@@ -1,5 +1,3 @@
-"""How the enclave talks to its NSM. Milestone 2 swaps the socket for /dev/nsm."""
-
 import socket
 from typing import Any, Protocol
 

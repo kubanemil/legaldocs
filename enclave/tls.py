@@ -1,10 +1,6 @@
-"""The enclave's TLS identity: a key made in memory and a self-signed certificate.
-
-Nobody issues this certificate. The parent trusts it only after an attestation document
-binds its hash to the enclave's measured code (attested TLS). The key and certificate are
-replaced halfway through their lifetime; a parent pinned to the old one fails its next
-handshake and re-attests.
-"""
+"""Nobody issues the enclave's certificate. The parent trusts it only after an attestation
+binds its hash to the measured code. It is replaced halfway through its lifetime, and a
+parent pinned to the old one fails its next handshake and re-attests."""
 
 import secrets
 import ssl
