@@ -96,12 +96,21 @@ class Policy:
 def verify(
     document: bytes, policy: Policy, nonce: bytes, now: datetime | None = None
 ) -> AttestationDocument:
+    """Check a document against the policy. Raises AttestationError and nothing else."""
+    try:
+        return _verify(document, policy, nonce, now or datetime.now(UTC))
+    except AttestationError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise AttestationError("malformed attestation document") from exc
+
+
+def _verify(document: bytes, policy: Policy, nonce: bytes, now: datetime) -> AttestationDocument:
     try:
         sign1 = cose.decode(document)
         doc = AttestationDocument.decode(sign1.payload)
     except ValueError as exc:
         raise AttestationError("malformed attestation document") from exc
-    now = now or datetime.now(UTC)
 
     leaf = _verify_chain(doc, policy.trust_anchor, now)
     public_key = leaf.public_key()

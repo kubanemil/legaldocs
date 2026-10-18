@@ -37,7 +37,10 @@ class Sign1:
 
     @property
     def alg(self) -> int:
-        header = cbor.decode_map(self.protected) if self.protected else {}
+        try:
+            header = cbor.decode_map(self.protected) if self.protected else {}
+        except cbor.DecodeError as exc:
+            raise CoseError("malformed protected header") from exc
         alg = header.get(_HEADER_ALG)
         if not isinstance(alg, int):
             raise CoseError("missing alg in protected header")

@@ -15,11 +15,12 @@ from protocol.attestation import (
     verify_enclave,
 )
 from scripts.certs import issue_parent_identity
+from tests.conftest import IN_PROCESS_TLS_CERTIFICATE
 
 
 def attest(enclave: EnclaveService) -> tuple[bytes, bytes]:
     nonce = os.urandom(32)
-    return enclave.attestation(nonce), nonce
+    return enclave.attestation(nonce, IN_PROCESS_TLS_CERTIFICATE), nonce
 
 
 def test_a_fresh_attestation_with_the_expected_pcr0_yields_the_enclave_keys(
@@ -123,9 +124,19 @@ def test_the_enclave_refuses_weak_or_oversized_nonces(
     enclave: EnclaveService, nonce: bytes
 ) -> None:
     with pytest.raises(EnclaveError):
-        enclave.attestation(nonce)
+        enclave.attestation(nonce, IN_PROCESS_TLS_CERTIFICATE)
 
 
 def test_garbage_is_not_an_attestation(policy: Policy) -> None:
     with pytest.raises(AttestationError, match="malformed"):
         verify(b"\xa0", policy, os.urandom(32))
+
+
+def test_a_malformed_protected_header_is_an_attestation_error(
+    enclave: EnclaveService, policy: Policy
+) -> None:
+    document, nonce = attest(enclave)
+    signed = cose.decode(document)
+    broken = cbor.encode([b"\xff", {}, signed.payload, signed.signature])
+    with pytest.raises(AttestationError):
+        verify(broken, policy, nonce)
