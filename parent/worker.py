@@ -16,7 +16,7 @@ from parent import pipeline
 from parent.chain import ChainError, Relayer
 from parent.config import Settings
 from parent.db import session_factory
-from parent.enclave_link import AttestedTlsLink, EnclaveUnavailable
+from parent.enclave_link import AttestedTlsLink
 
 app = Celery("legaldocs", broker=os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
 app.conf.update(
@@ -63,7 +63,13 @@ def _relayer() -> Relayer:
         return lock
 
     w3 = Web3(Web3.HTTPProvider(settings.eth_rpc_url))
-    return Relayer(w3, settings.registry_address, settings.relayer_key, nonce_lock)
+    return Relayer(
+        w3,
+        settings.registry_address,
+        settings.relayer_key,
+        nonce_lock,
+        deploy_block=settings.registry_deploy_block,
+    )
 
 
 # Celery logs and swallows exceptions from signal handlers; SystemExit is not swallowed.
@@ -78,25 +84,23 @@ def check_configuration(**_: object) -> None:
 
 @app.task(bind=True, max_retries=5)
 def process(self: Task, tenant_id: str, document_id: str) -> None:
+    last_attempt = self.request.retries >= self.max_retries
     with _sessions()() as session:
-        try:
-            completed = pipeline.process_document(session, _link(), tenant_id, UUID(document_id))
-        except EnclaveUnavailable as exc:
-            if self.request.retries >= self.max_retries:
-                pipeline.give_up(session, tenant_id, UUID(document_id))
-                return
-            raise self.retry(exc=exc, countdown=2**self.request.retries) from exc
-    if completed:
+        outcome = pipeline.process_document(
+            session, _link(), tenant_id, UUID(document_id), last_attempt=last_attempt
+        )
+    if outcome is pipeline.Outcome.RETRY:
+        raise self.retry(countdown=2**self.request.retries)
+    if outcome is pipeline.Outcome.DONE:
         anchor.delay(tenant_id, document_id)
 
 
 @app.task(bind=True, max_retries=8)
 def anchor(self: Task, tenant_id: str, document_id: str) -> None:
     with _sessions()() as session:
-        try:
-            pipeline.anchor_document(session, _relayer(), tenant_id, UUID(document_id))
-        except (ChainError, Web3Exception, OSError) as exc:
-            raise self.retry(exc=exc, countdown=min(2**self.request.retries, 60)) from exc
+        outcome = pipeline.anchor_document(session, _relayer, tenant_id, UUID(document_id))
+    if outcome is pipeline.Outcome.RETRY:
+        raise self.retry(countdown=min(2**self.request.retries, 60))
 
 
 def enqueue(tenant_id: str, document_id: UUID) -> None:

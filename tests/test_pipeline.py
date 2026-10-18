@@ -1,13 +1,23 @@
 import json
 import logging
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import NoReturn
+from uuid import UUID
 
 import pytest
+from redis.exceptions import LockError
 from sqlalchemy import select
 
 from client.sdk import ClientError, LegalDocsClient, ProcessingFailed
+from enclave.extractor import extract_fields
 from enclave.service import EnclaveKeys, EnclaveService
 from nsm.device import MockNsm
+from parent import pipeline
+from parent.chain import Anchored, ChainError
+from parent.enclave_link import EnclaveRejected, EnclaveUnavailable
 from parent.models import Document
+from parent.pipeline import Outcome
 from protocol import receipt
 from protocol.envelope import EnvelopeError
 from tests.conftest import Stack
@@ -104,7 +114,7 @@ def test_a_stale_enclave_key_fails_with_a_defined_code_and_the_client_recovers(
     stack: Stack, acme: LegalDocsClient, nsm: MockNsm
 ) -> None:
     before_restart = acme.attest()
-    stack.link.enclave = EnclaveService(nsm, EnclaveKeys.generate())
+    stack.link.enclave = EnclaveService(nsm, EnclaveKeys.generate(), extract_fields)
 
     stale = acme.submit(CONTRACT.encode(), before_restart)
     with pytest.raises(ProcessingFailed) as failure:
@@ -120,3 +130,124 @@ def test_the_stored_receipt_hash_is_what_gets_anchored(stack: Stack, acme: Legal
         stored = session.scalars(select(Document)).one()
     assert stored.receipt is not None
     assert stored.receipt_hash == receipt.anchor_hash(stored.receipt) == result.receipt_hash
+
+
+class _BrokenLink:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def attestation(self, nonce: bytes) -> bytes:
+        raise AssertionError("not used")
+
+    def process(self, request: object) -> NoReturn:
+        raise self.error
+
+
+def _submit_unprocessed(stack: Stack, client: LegalDocsClient) -> UUID:
+    stack.process_inline = False
+    return client.submit(CONTRACT.encode()).document_id
+
+
+def _status(stack: Stack, document_id: UUID) -> tuple[str, str | None]:
+    with stack.sessions() as session:
+        document = session.get(Document, ("acme", document_id))
+        assert document is not None
+        return document.status, document.error_code
+
+
+@pytest.mark.parametrize(
+    ("error", "last_attempt", "expected"),
+    [
+        (EnclaveUnavailable("down"), False, (Outcome.RETRY, "PROCESSING", None)),
+        (EnclaveUnavailable("down"), True, (Outcome.FAILED, "FAILED", "enclave_unavailable")),
+        (ValueError("bad enclave response"), False, (Outcome.FAILED, "FAILED", "internal_error")),
+        (
+            EnclaveRejected("processing_timeout", 422),
+            False,
+            (Outcome.FAILED, "FAILED", "processing_timeout"),
+        ),
+    ],
+    ids=["unavailable, will retry", "unavailable, last attempt", "unexpected error", "timeout"],
+)
+def test_a_document_never_stays_processing_after_its_last_attempt(
+    stack: Stack,
+    acme: LegalDocsClient,
+    error: Exception,
+    last_attempt: bool,
+    expected: tuple[Outcome, str, str | None],
+) -> None:
+    document_id = _submit_unprocessed(stack, acme)
+    with stack.sessions() as session:
+        outcome = pipeline.process_document(
+            session, _BrokenLink(error), "acme", document_id, last_attempt=last_attempt
+        )
+    assert (outcome, *_status(stack, document_id)) == expected
+
+
+def test_waiting_for_the_anchor_waits_for_the_mined_timestamp_not_the_tx_hash(
+    stack: Stack, acme: LegalDocsClient
+) -> None:
+    submission = acme.submit(CONTRACT.encode())
+    with stack.sessions() as session:
+        document = session.get(Document, ("acme", submission.document_id))
+        assert document is not None
+        document.anchor_tx = "0x" + "ab" * 32
+        session.commit()
+    with pytest.raises(ClientError, match="not ready"):
+        acme.wait(submission, anchored=True, timeout=0.3)
+
+    with stack.sessions() as session:
+        document = session.get(Document, ("acme", submission.document_id))
+        assert document is not None
+        document.anchored_at = datetime.now(UTC)
+        session.commit()
+    assert acme.wait(submission, anchored=True, timeout=1).anchored_at
+
+
+class _FakeRelayer:
+    def __init__(self, result: Anchored | Exception) -> None:
+        self.result = result
+
+    def anchor(
+        self, receipt_hash: bytes, *, known_tx: str | None, on_sent: Callable[[str], None]
+    ) -> Anchored:
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+@pytest.mark.parametrize(
+    "error",
+    [LockError("nonce lock busy"), ChainError("no registry yet"), ConnectionError("rpc down")],
+    ids=["nonce lock timeout", "registry missing", "rpc unreachable"],
+)
+def test_anchoring_retries_when_the_lock_or_chain_is_unavailable(
+    stack: Stack, acme: LegalDocsClient, error: Exception
+) -> None:
+    document_id = acme.submit(CONTRACT.encode()).document_id
+
+    def relayer() -> _FakeRelayer:
+        if isinstance(error, ChainError):
+            raise error
+        return _FakeRelayer(error)
+
+    with stack.sessions() as session:
+        assert pipeline.anchor_document(session, relayer, "acme", document_id) is Outcome.RETRY
+        document = session.get(Document, ("acme", document_id))
+        assert document is not None
+        assert document.anchored_at is None
+
+
+def test_an_anchor_found_without_its_tx_hash_never_stores_an_empty_one(
+    stack: Stack, acme: LegalDocsClient
+) -> None:
+    document_id = acme.submit(CONTRACT.encode()).document_id
+    with stack.sessions() as session:
+        outcome = pipeline.anchor_document(
+            session, lambda: _FakeRelayer(Anchored(None, 1_800_000_000)), "acme", document_id
+        )
+        document = session.get(Document, ("acme", document_id))
+    assert outcome is Outcome.DONE
+    assert document is not None
+    assert document.anchor_tx is None
+    assert document.anchored_at is not None

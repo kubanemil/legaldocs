@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+import logging
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +23,8 @@ from parent.db import session_factory
 from parent.enclave_link import AttestedTlsLink, EnclaveLink, EnclaveRejected, EnclaveUnavailable
 from parent.models import Document, Status
 from protocol.envelope import Envelope, EnvelopeError
+
+log = logging.getLogger("parent.api")
 
 
 class SubmitRequest(BaseModel):
@@ -119,7 +122,7 @@ def create_app(services: Services) -> FastAPI:
 
     @app.get("/attestation")
     def attestation(
-        _: TenantId, nonce: Annotated[str, Query(pattern="^[0-9a-f]{32,128}$")]
+        _: TenantId, nonce: Annotated[str, Query(pattern="^([0-9a-f]{2}){16,64}$")]
     ) -> AttestationView:
         try:
             document = services.enclave.attestation(bytes.fromhex(nonce))
@@ -129,23 +132,7 @@ def create_app(services: Services) -> FastAPI:
 
     @app.post("/documents", status_code=202)
     def submit(request: SubmitRequest, tenant_id: TenantId, db: Db) -> DocumentView:
-        try:
-            envelope = base64.b64decode(request.envelope, validate=True)
-            Envelope.decode(envelope)
-        except (binascii.Error, EnvelopeError) as exc:
-            raise HTTPException(422, "envelope is not a sealed document") from exc
-        if len(envelope) > services.max_envelope_bytes:
-            raise HTTPException(413, "envelope too large")
-
-        document = Document(tenant_id=tenant_id, id=request.document_id, envelope=envelope)
-        db.add(document)
-        try:
-            db.commit()
-        except IntegrityError as exc:
-            raise HTTPException(409, "document id already used") from exc
-        services.enqueue(tenant_id, document.id)
-        db.refresh(document)
-        return DocumentView.of(document)
+        return DocumentView.of(_submit(services, db, tenant_id, request))
 
     @app.get("/documents")
     def list_documents(tenant_id: TenantId, db: Db, status: Status | None = None) -> DocumentList:
@@ -163,6 +150,32 @@ def create_app(services: Services) -> FastAPI:
         return DocumentView.of(document)
 
     return app
+
+
+def _submit(services: Services, db: Session, tenant_id: str, request: SubmitRequest) -> Document:
+    try:
+        envelope = base64.b64decode(request.envelope, validate=True)
+        Envelope.decode(envelope)
+    except (binascii.Error, EnvelopeError) as exc:
+        raise HTTPException(422, "envelope is not a sealed document") from exc
+    if len(envelope) > services.max_envelope_bytes:
+        raise HTTPException(413, "envelope too large")
+
+    document = Document(tenant_id=tenant_id, id=request.document_id, envelope=envelope)
+    db.add(document)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        raise HTTPException(409, "document id already used") from exc
+    try:
+        services.enqueue(tenant_id, document.id)
+    except Exception as exc:
+        log.exception("could not queue document=%s; removing it", document.id)
+        db.delete(document)
+        db.commit()
+        raise HTTPException(503, "could not queue the document; retry with the same id") from exc
+    db.refresh(document)
+    return document
 
 
 def app_from_env() -> FastAPI:

@@ -58,6 +58,7 @@ class Result:
     receipt: receipt.Receipt
     receipt_hash: bytes
     anchor_tx: str | None
+    anchored_at: str | None
 
 
 class LegalDocsClient:
@@ -122,7 +123,7 @@ class LegalDocsClient:
             document = self.status(submission.document_id)
             if document["status"] == "FAILED":
                 raise ProcessingFailed(document["error_code"] or "unknown")
-            if document["status"] == "COMPLETED" and (document["anchor_tx"] or not anchored):
+            if document["status"] == "COMPLETED" and (document["anchored_at"] or not anchored):
                 return self.open(submission, document)
             if time.monotonic() > deadline:
                 raise ClientError(f"document {submission.document_id} not ready after {timeout}s")
@@ -158,6 +159,7 @@ class LegalDocsClient:
             receipt=checked,
             receipt_hash=receipt_hash,
             anchor_tx=document["anchor_tx"],
+            anchored_at=document["anchored_at"],
         )
 
     def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:

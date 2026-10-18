@@ -11,7 +11,7 @@ from parent.models import ApiKey, Document
 from protocol import cose, envelope
 from protocol.attestation import AttestationDocument
 from protocol.envelope import Binding
-from tests.conftest import Stack
+from tests.conftest import IN_PROCESS_TLS_CERTIFICATE, Stack
 
 
 def sealed_body(enclave: EnclaveService, tenant_id: str) -> dict[str, str]:
@@ -24,7 +24,9 @@ def sealed_body(enclave: EnclaveService, tenant_id: str) -> dict[str, str]:
 
 
 def _attested_public_key(enclave: EnclaveService) -> bytes:
-    document = AttestationDocument.decode(cose.decode(enclave.attestation(os.urandom(32))).payload)
+    document = AttestationDocument.decode(
+        cose.decode(enclave.attestation(os.urandom(32), IN_PROCESS_TLS_CERTIFICATE)).payload
+    )
     assert document.public_key is not None
     return document.public_key
 
@@ -117,3 +119,27 @@ def test_the_queue_only_carries_ids(stack: Stack, enclave: EnclaveService) -> No
     body = sealed_body(enclave, "acme")
     stack.http.post("/documents", json=body, headers=bearer(token))
     assert [(tenant, str(doc)) for tenant, doc in stack.enqueued] == [("acme", body["document_id"])]
+
+
+def test_a_submission_that_cannot_be_queued_is_rolled_back(
+    stack: Stack, enclave: EnclaveService
+) -> None:
+    token = stack.tenant("acme")
+    body = sealed_body(enclave, "acme")
+
+    stack.broker_down = True
+    assert stack.http.post("/documents", json=body, headers=bearer(token)).status_code == 503
+    document_id = body["document_id"]
+    assert stack.http.get(f"/documents/{document_id}", headers=bearer(token)).status_code == 404
+
+    stack.broker_down = False
+    assert stack.http.post("/documents", json=body, headers=bearer(token)).status_code == 202
+
+
+@pytest.mark.parametrize(
+    "nonce", ["a" * 33, "0" * 31, "zz" * 16, "00" * 65], ids=["odd", "short", "not hex", "long"]
+)
+def test_only_whole_byte_nonces_of_16_to_64_bytes_are_accepted(stack: Stack, nonce: str) -> None:
+    token = stack.tenant("acme")
+    response = stack.http.get("/attestation", params={"nonce": nonce}, headers=bearer(token))
+    assert response.status_code == 422
