@@ -1,9 +1,3 @@
-"""Client SDK. Plaintext exists only here and inside an attested enclave.
-
-The client checks the enclave's attestation before it seals anything, seals each document
-to the attested key, and opens results with a key pair it made for that one request.
-"""
-
 import base64
 import hmac
 import json

@@ -1,8 +1,5 @@
-"""Runs extraction in worker processes, so a request past its deadline can be stopped.
-
-A thread cannot be killed; a process can. When a job overruns, its worker is killed and
-replaced, and the request that owned it gets a timeout instead of holding a slot.
-"""
+"""Extraction runs in processes because a thread cannot be killed. A job past its deadline
+has its worker killed and replaced."""
 
 import multiprocessing
 import queue

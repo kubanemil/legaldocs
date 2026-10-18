@@ -1,7 +1,5 @@
-"""Per-tenant API keys. Only a SHA-256 of each secret is stored.
-
-A fast hash is enough: secrets are 256 random bits, so there is nothing to brute-force.
-"""
+"""Only a SHA-256 of each secret is stored. A fast hash is enough because secrets are 256
+random bits."""
 
 import hashlib
 import hmac

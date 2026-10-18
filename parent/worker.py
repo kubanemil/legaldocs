@@ -1,4 +1,4 @@
-"""Celery tasks. Arguments are ids only; ciphertext never passes through the broker."""
+"""Task arguments are ids only, so ciphertext never passes through the broker."""
 
 import os
 from functools import cache

@@ -1,9 +1,5 @@
-"""A software stand-in for the Nitro Security Module.
-
-It holds the only key that can sign attestation documents and reports PCRs it measured
-itself. In the compose stack it runs in its own container with no network; the enclave
-reaches it through a Unix socket and the parent cannot reach it at all.
-"""
+"""A software Nitro Security Module. It holds the only key that signs attestations and
+reports PCRs it measured itself."""
 
 import secrets
 import threading

@@ -1,5 +1,3 @@
-"""Deterministic CBOR encoding and strict decoding."""
-
 from io import BytesIO
 from typing import Any
 

@@ -39,7 +39,7 @@ class ApiKey(Base):
 
 
 class Document(Base):
-    """Everything here is ciphertext, a signature or a hash. The parent stores no plaintext."""
+    """Everything here is ciphertext, a signature or a hash."""
 
     __tablename__ = "documents"
     __table_args__ = (

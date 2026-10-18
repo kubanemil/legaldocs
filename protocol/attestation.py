@@ -1,8 +1,4 @@
-"""Attestation documents in the AWS Nitro Enclaves format, and how a relying party checks them.
-
-The verifier knows nothing about the mock: pointed at the AWS Nitro root certificate it
-checks real NSM documents the same way.
-"""
+"""Attestation documents in the AWS Nitro format. Nothing here knows about the mock NSM."""
 
 import hashlib
 import hmac
@@ -96,7 +92,7 @@ class Policy:
 def verify(
     document: bytes, policy: Policy, nonce: bytes, now: datetime | None = None
 ) -> AttestationDocument:
-    """Check a document against the policy. Raises AttestationError and nothing else."""
+    """Raises AttestationError and nothing else."""
     try:
         return _verify(document, policy, nonce, now or datetime.now(UTC))
     except AttestationError:
@@ -182,8 +178,6 @@ def _extension[E: x509.ExtensionType](cert: x509.Certificate, kind: type[E]) -> 
 
 @dataclass(frozen=True)
 class EnclaveIdentity:
-    """What a verified attestation tells a relying party about this enclave instance."""
-
     encryption_key: x25519.X25519PublicKey
     signing_key: ed25519.Ed25519PublicKey
     tls_cert_sha256: bytes

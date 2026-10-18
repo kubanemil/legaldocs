@@ -1,5 +1,3 @@
-"""The public API. It authenticates tenants and stores ciphertext; it cannot decrypt anything."""
-
 import base64
 import binascii
 import logging

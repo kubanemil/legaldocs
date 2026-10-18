@@ -1,5 +1,3 @@
-"""The enclave's HTTPS endpoint: mutual TLS, bounded concurrency, bounded reads, fixed errors."""
-
 import json
 import logging
 import os
