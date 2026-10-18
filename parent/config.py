@@ -17,6 +17,7 @@ class Settings:
     expected_pcr0: str
     eth_rpc_url: str
     registry_address: str
+    registry_deploy_block: int
     relayer_key: str
     max_envelope_bytes: int
 
@@ -38,6 +39,7 @@ class Settings:
             expected_pcr0=env["EXPECTED_PCR0"],
             eth_rpc_url=env.get("ETH_RPC_URL", ""),
             registry_address=env.get("REGISTRY_ADDRESS", ""),
+            registry_deploy_block=int(env.get("REGISTRY_DEPLOY_BLOCK", "0")),
             relayer_key=env.get("RELAYER_KEY", ""),
             max_envelope_bytes=int(env.get("MAX_ENVELOPE_BYTES", str(4 * 1024 * 1024))),
         )

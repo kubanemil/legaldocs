@@ -3,6 +3,7 @@ name: legaldocs
 x-chain: &chain
   ETH_RPC_URL: http://anvil:8545
   REGISTRY_ADDRESS: "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+  REGISTRY_DEPLOY_BLOCK: "1"
 
 x-parent: &parent
   image: legaldocs-parent
