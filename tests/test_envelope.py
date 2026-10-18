@@ -76,3 +76,8 @@ def test_an_envelope_for_a_previous_key_is_reported_as_stale(
 def test_malformed_envelopes_are_rejected(data: bytes) -> None:
     with pytest.raises(EnvelopeError):
         Envelope.decode(data)
+
+
+def test_a_low_order_reply_key_is_refused() -> None:
+    with pytest.raises(EnvelopeError):
+        envelope.load_public_key(bytes(32))

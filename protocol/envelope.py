@@ -71,9 +71,11 @@ def raw_public_key(public_key: x25519.X25519PublicKey) -> bytes:
 
 def load_public_key(raw: bytes) -> x25519.X25519PublicKey:
     try:
-        return x25519.X25519PublicKey.from_public_bytes(raw)
+        key = x25519.X25519PublicKey.from_public_bytes(raw)
+        x25519.X25519PrivateKey.generate().exchange(key)
     except ValueError as exc:
-        raise EnvelopeError("not an X25519 public key") from exc
+        raise EnvelopeError("not a usable X25519 public key") from exc
+    return key
 
 
 # cryptography's public HPKE API is single-shot and takes only `info`. In single-shot
