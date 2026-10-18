@@ -1,38 +1,20 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-*.whl
-
-# Virtual environments
 .venv/
-venv/
-ENV/
-
-# Environment variables
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 .env
 
-# Certificates (generated, not committed)
+# Generated at runtime, never committed
 certs/
+trust/
 
-# IDE
+# Foundry build output
+contracts/out/
+contracts/cache/
+
 .idea/
 .vscode/
-*.swp
-*.swo
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Pipeline state
-.pipeline/
-
-# Local config
 .claude/

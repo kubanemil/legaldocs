@@ -1,0 +1,18 @@
+[profile.default]
+src = "contracts/src"
+test = "contracts/test"
+out = "contracts/out"
+cache_path = "contracts/cache"
+libs = ["contracts/lib"]
+solc_version = "0.8.30"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 10_000
+bytecode_hash = "none"
+cbor_metadata = false
+
+[fuzz]
+runs = 512
+
+[fmt]
+line_length = 100

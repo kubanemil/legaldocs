@@ -1,141 +1,171 @@
+name: legaldocs
+
+x-chain: &chain
+  ETH_RPC_URL: http://anvil:8545
+  REGISTRY_ADDRESS: "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+  REGISTRY_DEPLOY_BLOCK: "1"
+
+x-parent: &parent
+  image: legaldocs-parent
+  build:
+    context: .
+    dockerfile: parent/Dockerfile
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+x-parent-env: &parent-env
+  <<: *chain
+  DATABASE_URL: postgresql+psycopg://legaldocs:legaldocs@postgres:5432/legaldocs
+  REDIS_URL: redis://redis:6379/0
+  ENCLAVE_HOST: enclave
+  ENCLAVE_PORT: "8443"
+  PARENT_CERT: /run/secrets/parent_cert
+  PARENT_KEY: /run/secrets/parent_key
+  NSM_TRUST_ANCHOR: /trust/nsm-root.pem
+  EXPECTED_PCR0: ${EXPECTED_PCR0:-}
+
 services:
   postgres:
-    image: postgres:16-alpine
-    networks:
-      - external-net
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     environment:
       POSTGRES_DB: legaldocs
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: legaldocs
+      POSTGRES_PASSWORD: legaldocs
+    networks: [backend]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d legaldocs"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "pg_isready -U legaldocs -d legaldocs"]
+      interval: 2s
+      retries: 30
 
   redis:
-    image: redis:7-alpine
-    networks:
-      - external-net
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    networks: [backend]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      interval: 2s
+      retries: 30
 
-  ganache:
-    image: trufflesuite/ganache:latest
-    networks:
-      - external-net
-    command: >
-      --deterministic
-      --accounts 10
-      --defaultBalanceEther 1000
-      --host 0.0.0.0
-      --port 8545
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:v1.8.5@sha256:32c8ea9ef052a440cb1620175987a3f49eff8b068a0c6a3d09ebf7f5f9a0e043
+    command: ["anvil --host 0.0.0.0 --chain-id 31337 --silent"]
+    ports: ["127.0.0.1:${ANVIL_PORT:-8545}:8545"]
+    networks: [backend]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8545 || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://localhost:8545"]
+      interval: 2s
+      retries: 30
 
-  migrate:
+  nsm:
     build:
       context: .
-      dockerfile: parent/Dockerfile
-    command: alembic upgrade head
-    networks:
-      - external-net
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: "no"
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/legaldocs
-
-  api:
-    build:
-      context: .
-      dockerfile: parent/Dockerfile
-    command: uvicorn parent.api.main:app --host 0.0.0.0 --port 8000
-    ports:
-      - "8000:8000"
-    networks:
-      - external-net
-      - enclave-net
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      ganache:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/legaldocs
-      REDIS_URL: redis://redis:6379/0
-      ENCLAVE_HOST: enclave
-      ENCLAVE_PORT: "8443"
-      CA_CERT_PATH: /certs/ca.crt
-      CLIENT_CERT_PATH: /certs/parent.crt
-      CLIENT_KEY_PATH: /certs/parent.key
-      ETH_RPC_URL: http://ganache:8545
+      dockerfile: nsm/Dockerfile
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     volumes:
-      - ./certs:/certs:ro
-
-  worker:
-    build:
-      context: .
-      dockerfile: parent/Dockerfile
-    command: celery -A parent.workers.celery_app worker --loglevel=info
-    networks:
-      - external-net
-      - enclave-net
-    depends_on:
-      redis:
-        condition: service_healthy
-      ganache:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/legaldocs
-      REDIS_URL: redis://redis:6379/0
-      ENCLAVE_HOST: enclave
-      ENCLAVE_PORT: "8443"
-      CA_CERT_PATH: /certs/ca.crt
-      CLIENT_CERT_PATH: /certs/parent.crt
-      CLIENT_KEY_PATH: /certs/parent.key
-      ETH_RPC_URL: http://ganache:8545
-    volumes:
-      - ./certs:/certs:ro
+      - nsm-socket:/run/nsm
+      - nsm-trust:/trust
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/nsm/nsm.sock && test -f /trust/nsm-root.pem"]
+      interval: 1s
+      retries: 30
 
   enclave:
     build:
       context: .
       dockerfile: enclave/Dockerfile
-    networks:
-      - enclave-net
+    networks: [vsock]
     read_only: true
-    tmpfs:
-      - /tmp
-    environment:
-      ENCLAVE_CERT_PATH: /certs/enclave.crt
-      ENCLAVE_KEY_PATH: /certs/enclave.key
-      CA_CERT_PATH: /certs/ca.crt
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     volumes:
-      - ./certs:/certs:ro
+      - nsm-socket:/run/nsm
+    configs:
+      - source: parent_ca
+        target: /etc/legaldocs/parent-ca.crt
+    environment:
+      PARENT_CA: /etc/legaldocs/parent-ca.crt
+    depends_on:
+      nsm: {condition: service_healthy}
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import ssl,urllib.request; ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_cert_chain('/certs/parent.crt','/certs/parent.key'); ctx.load_verify_locations('/certs/ca.crt'); ctx.check_hostname=False; urllib.request.urlopen('https://localhost:8443/health',context=ctx)\" || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+      test: ["CMD", "python", "-c", "from enclave.server import healthcheck; healthcheck()"]
+      interval: 1s
+      retries: 30
+
+  migrate:
+    <<: *parent
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://legaldocs:legaldocs@postgres:5432/legaldocs
+    networks: [backend]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  deploy:
+    <<: *parent
+    command: ["python", "-m", "parent.chain", "deploy"]
+    # anvil's well-known development accounts: account 0 owns the registry, account 1 relays.
+    environment:
+      <<: *chain
+      OWNER_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      RELAYER_ADDRESS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+    networks: [backend]
+    depends_on:
+      anvil: {condition: service_healthy}
+
+  api:
+    <<: *parent
+    command: ["uvicorn", "--factory", "parent.api:app_from_env", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *parent-env
+    secrets: [parent_cert, parent_key]
+    volumes:
+      - nsm-trust:/trust:ro
+    ports: ["127.0.0.1:${API_PORT:-8000}:8000"]
+    networks: [backend, vsock]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      enclave: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 2s
+      retries: 30
+
+  worker:
+    <<: *parent
+    command: ["celery", "--app", "parent.worker", "worker", "--concurrency", "2", "--loglevel", "INFO"]
+    environment:
+      <<: *parent-env
+      RELAYER_KEY: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    secrets: [parent_cert, parent_key]
+    volumes:
+      - nsm-trust:/trust:ro
+    networks: [backend, vsock]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      deploy: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      enclave: {condition: service_healthy}
 
 networks:
-  external-net:
-    driver: bridge
-  enclave-net:
-    driver: bridge
+  backend: {}
+  vsock:
     internal: true
+
+volumes:
+  nsm-socket: {}
+  nsm-trust: {}
+
+secrets:
+  parent_cert:
+    file: ./certs/parent.crt
+  parent_key:
+    file: ./certs/parent.key
+
+configs:
+  parent_ca:
+    file: ./certs/parent-ca.crt

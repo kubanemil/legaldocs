@@ -1,0 +1,10 @@
+**/__pycache__
+**/*.pyc
+**/.*
+.venv
+certs
+trust
+tests
+contracts/lib
+contracts/out
+contracts/cache

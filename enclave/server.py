@@ -1,295 +1,197 @@
-"""mTLS HTTP server for the enclave.
+"""The enclave's HTTPS endpoint: mutual TLS, bounded concurrency, bounded reads, fixed errors."""
 
-Provides /health, /attestation, and /decrypt endpoints over HTTPS
-with mutual TLS authentication.
-"""
-
-import base64
 import json
 import logging
 import os
+import socket
 import ssl
 import sys
+import threading
 import time
-import traceback
-import uuid
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Final
+from urllib.parse import parse_qs, urlsplit
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from enclave.nsm_client import UnixSocketNsm
+from enclave.service import EnclaveError, EnclaveKeys, EnclaveService
+from enclave.tls import TlsIdentity, is_parent
+from enclave.workers import WorkerPool
 
-from crypto import CryptoManager
-from extractor import extract_fields
+READ_CHUNK_BYTES: Final = 64 * 1024
 
-
-# ---------------------------------------------------------------------------
-# Standalone JSON logging for the enclave (no shared module with parent)
-# ---------------------------------------------------------------------------
-
-class _EnclaveJSONFormatter(logging.Formatter):
-    """Formats log records as single-line JSON."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        entry: dict = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-            "service": "enclave",
-        }
-        for key in ("correlation_id", "stage", "duration_ms", "status_code", "method", "endpoint"):
-            value = getattr(record, key, None)
-            if value is not None:
-                entry[key] = value
-        if record.exc_info and record.exc_info[0] is not None:
-            entry["exception"] = "".join(traceback.format_exception(*record.exc_info))
-        return json.dumps(entry, default=str)
+log = logging.getLogger("enclave.http")
 
 
-def _setup_enclave_logging() -> logging.Logger:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_EnclaveJSONFormatter())
-    root = logging.getLogger()
-    root.addHandler(handler)
-    root.setLevel(logging.INFO)
-    return logging.getLogger("enclave")
+class EnclaveHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
 
+    def __init__(
+        self,
+        address: tuple[str, int],
+        service: EnclaveService,
+        tls: TlsIdentity,
+        *,
+        max_connections: int = 32,
+        max_body_bytes: int = 8 * 1024 * 1024,
+        io_timeout: float = 10.0,
+    ) -> None:
+        self.service = service
+        self.tls = tls
+        self.max_body_bytes = max_body_bytes
+        self.io_timeout = io_timeout
+        self._slots = threading.BoundedSemaphore(max_connections)
+        # finish_request builds each handler itself, passing the connection's certificate.
+        super().__init__(address, EnclaveHandler)  # type: ignore[arg-type]
 
-enclave_logger = _setup_enclave_logging()
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            log.warning("refused connection: at capacity")
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
 
-# ---------------------------------------------------------------------------
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
+    def finish_request(self, request: Any, client_address: Any) -> None:
+        request.settimeout(self.io_timeout)
+        context, certificate = self.tls.current()
+        try:
+            connection = context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError) as exc:
+            log.info("TLS handshake failed: %s", type(exc).__name__)
+            return
+        with connection:
+            if not is_parent(connection.getpeercert()):
+                log.warning("refused client certificate without the parent name")
+                return
+            EnclaveHandler(connection, client_address, self, certificate)
 
-def create_ssl_context() -> ssl.SSLContext:
-    """Create an SSL context requiring client certificate verification."""
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(
-        certfile=os.environ.get("ENCLAVE_CERT_PATH", "/certs/enclave.crt"),
-        keyfile=os.environ.get("ENCLAVE_KEY_PATH", "/certs/enclave.key"),
-    )
-    context.load_verify_locations(
-        cafile=os.environ.get("CA_CERT_PATH", "/certs/ca.crt")
-    )
-    context.verify_mode = ssl.CERT_REQUIRED
-    return context
-
-
-def _load_signing_key():
-    """Load the enclave mTLS private key for attestation signing."""
-    key_path = os.environ.get("ENCLAVE_KEY_PATH", "/certs/enclave.key")
-    with open(key_path, "rb") as f:
-        return serialization.load_pem_private_key(f.read(), password=None)
-
-
-def _load_certificate() -> str:
-    """Load the enclave mTLS certificate as a PEM string."""
-    cert_path = os.environ.get("ENCLAVE_CERT_PATH", "/certs/enclave.crt")
-    with open(cert_path, "rb") as f:
-        return f.read().decode("utf-8")
-
-
-class EnclaveHTTPServer(HTTPServer):
-    """Custom HTTP server that holds a CryptoManager instance."""
-
-    def __init__(self, server_address, handler_class, crypto_manager: CryptoManager):
-        self.crypto = crypto_manager
-        super().__init__(server_address, handler_class)
-
-
-# Stable enclave ID generated once at module import (persists for server lifetime)
-_ENCLAVE_ID = str(uuid.uuid4())
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        log.error("connection failed: %s", type(sys.exc_info()[1]).__name__)
 
 
 class EnclaveHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the enclave server."""
+    server: EnclaveHTTPServer
+    server_version = "enclave"
+    sys_version = ""
 
-    server: EnclaveHTTPServer  # type hint for IDE support
+    def __init__(
+        self, request: Any, client_address: Any, server: EnclaveHTTPServer, certificate: bytes
+    ) -> None:
+        self.certificate = certificate
+        super().__init__(request, client_address, server)
 
     def do_GET(self) -> None:
-        if self.path == "/health":
-            self._handle_health()
-        elif self.path == "/attestation":
-            self._handle_attestation()
+        url = urlsplit(self.path)
+        if url.path == "/health":
+            self._reply(200, b'{"status":"ok"}', "application/json")
+        elif url.path == "/attestation":
+            nonces = parse_qs(url.query).get("nonce", [])
+            try:
+                nonce = bytes.fromhex(nonces[0]) if len(nonces) == 1 else b""
+            except ValueError:
+                nonce = b""
+            self._run(lambda: self.server.service.attestation(nonce, self.certificate))
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._error(404, "not_found")
 
     def do_POST(self) -> None:
-        if self.path == "/decrypt":
-            self._handle_decrypt()
-        elif self.path == "/process":
-            self._handle_process()
+        if self.path != "/process":
+            self._error(404, "not_found")
+            return
+        body = self._read_body()
+        if body is not None:
+            self._run(lambda: self.server.service.process(body))
+
+    def _run(self, action: Callable[[], bytes]) -> None:
+        try:
+            payload = action()
+        except EnclaveError as exc:
+            self._error(exc.status, exc.code)
+        except Exception as exc:
+            log.error("internal error: %s", type(exc).__name__)
+            self._error(500, "internal")
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._reply(200, payload, "application/cbor")
 
-    def _handle_health(self) -> None:
-        response = json.dumps({"status": "healthy", "service": "enclave"})
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+    def _read_body(self) -> bytes | None:
+        length = self.headers.get("Content-Length", "")
+        if self.headers.get("Transfer-Encoding") or not length.isdigit():
+            self._error(411, "length_required")
+            return None
+        remaining = int(length)
+        if remaining > self.server.max_body_bytes:
+            self._error(413, "too_large")
+            return None
+        deadline = time.monotonic() + self.server.io_timeout
+        body = bytearray()
+        while remaining:
+            if time.monotonic() > deadline:
+                raise TimeoutError("request body too slow")
+            chunk = self.rfile.read1(min(remaining, READ_CHUNK_BYTES))
+            if not chunk:
+                raise ConnectionError("request body truncated")
+            body += chunk
+            remaining -= len(chunk)
+        return bytes(body)
+
+    def _error(self, status: int, code: str) -> None:
+        self._reply(status, json.dumps({"error": code}).encode(), "application/json")
+
+    def _reply(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(response.encode())
+        self.wfile.write(body)
 
-    def _handle_attestation(self) -> None:
-        payload = {
-            "enclave_id": _ENCLAVE_ID,
-            "public_key": self.server.crypto.get_public_key_pem().decode("utf-8"),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "platform": "docker-simulation",
-        }
-
-        # Serialize payload to deterministic JSON bytes for signing
-        payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-
-        # Sign with enclave mTLS private key using PKCS1v15 + SHA256
-        signing_key = _load_signing_key()
-        signature = signing_key.sign(
-            payload_bytes,
-            asym_padding.PKCS1v15(),
-            hashes.SHA256(),
-        )
-
-        certificate = _load_certificate()
-
-        response = json.dumps({
-            "payload": payload,
-            "signature": base64.b64encode(signature).decode("utf-8"),
-            "certificate": certificate,
-        })
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(response.encode())
-
-        enclave_logger.info(
-            "Attestation served",
-            extra={"stage": "enclave.attestation", "endpoint": "/attestation", "method": "GET", "status_code": 200},
-        )
-
-    def _handle_process(self) -> None:
-        """Handle POST /process: decrypt, extract fields, encrypt results."""
-        correlation_id = self.headers.get("X-Correlation-ID")
-        start = time.monotonic()
+    def handle_one_request(self) -> None:
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            encrypted_blob = self.rfile.read(content_length)
+            super().handle_one_request()
+        except (TimeoutError, ConnectionError, ssl.SSLError) as exc:
+            log.info("dropped connection: %s", type(exc).__name__)
+            self.close_connection = True
 
-            # Decrypt the document
-            plaintext = self.server.crypto.decrypt_document(encrypted_blob)
-
-            # Extract fields from plaintext
-            results = extract_fields(plaintext.decode("utf-8"))
-
-            # Serialize results to JSON bytes
-            json_bytes = json.dumps(results).encode("utf-8")
-
-            # Encrypt results with enclave's public key
-            encrypted_results = CryptoManager.encrypt_document(
-                json_bytes, self.server.crypto.get_public_key_pem()
-            )
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.end_headers()
-            self.wfile.write(encrypted_results)
-
-            duration_ms = (time.monotonic() - start) * 1000
-            enclave_logger.info(
-                "Document processed",
-                extra={
-                    "correlation_id": correlation_id,
-                    "stage": "enclave.process",
-                    "endpoint": "/process",
-                    "method": "POST",
-                    "duration_ms": round(duration_ms, 2),
-                    "status_code": 200,
-                },
-            )
-        except Exception as e:
-            error_response = json.dumps({"error": str(e)})
-            self.send_response(400)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(error_response.encode())
-
-            duration_ms = (time.monotonic() - start) * 1000
-            enclave_logger.error(
-                "Process failed",
-                extra={
-                    "correlation_id": correlation_id,
-                    "stage": "enclave.process",
-                    "endpoint": "/process",
-                    "method": "POST",
-                    "duration_ms": round(duration_ms, 2),
-                    "status_code": 400,
-                },
-            )
-
-    def _handle_decrypt(self) -> None:
-        correlation_id = self.headers.get("X-Correlation-ID")
-        start = time.monotonic()
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            encrypted_blob = self.rfile.read(content_length)
-            decrypted = self.server.crypto.decrypt_document(encrypted_blob)
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.end_headers()
-            self.wfile.write(decrypted)
-
-            duration_ms = (time.monotonic() - start) * 1000
-            enclave_logger.info(
-                "Decrypt completed",
-                extra={
-                    "correlation_id": correlation_id,
-                    "stage": "enclave.decrypt",
-                    "endpoint": "/decrypt",
-                    "method": "POST",
-                    "duration_ms": round(duration_ms, 2),
-                    "status_code": 200,
-                },
-            )
-        except Exception as e:
-            error_response = json.dumps({"error": str(e)})
-            self.send_response(400)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(error_response.encode())
-
-            duration_ms = (time.monotonic() - start) * 1000
-            enclave_logger.error(
-                "Decrypt failed",
-                extra={
-                    "correlation_id": correlation_id,
-                    "stage": "enclave.decrypt",
-                    "endpoint": "/decrypt",
-                    "method": "POST",
-                    "duration_ms": round(duration_ms, 2),
-                    "status_code": 400,
-                },
-            )
-
-    def log_message(self, format: str, *args) -> None:
-        """Override default stderr logging to use structured logger."""
-        enclave_logger.info(
-            "HTTP %s %s %s" % args,
-            extra={"stage": "enclave.http"},
-        )
+    def log_message(self, format: str, *args: Any) -> None:
+        log.info("%s %s", self.address_string(), format % args)
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8443) -> None:
-    """Start the mTLS HTTPS server."""
-    crypto_manager = CryptoManager()
-    server = EnclaveHTTPServer((host, port), EnclaveHandler, crypto_manager)
-    ssl_context = create_ssl_context()
-    server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
-    enclave_logger.info(f"Enclave server running on https://{host}:{port}")
-    enclave_logger.info(f"Enclave ID: {_ENCLAVE_ID}")
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    extract = WorkerPool(
+        workers=int(os.environ.get("EXTRACT_WORKERS", "2")),
+        deadline=float(os.environ.get("PROCESS_DEADLINE_SECONDS", "10")),
+    )
+    nsm = UnixSocketNsm(os.environ.get("NSM_SOCKET", "/run/nsm/nsm.sock"))
+    service = EnclaveService(nsm, EnclaveKeys.generate(), extract)
+    tls = TlsIdentity(Path(os.environ["PARENT_CA"]).read_bytes())
+    address = (os.environ.get("BIND_HOST", "0.0.0.0"), int(os.environ.get("PORT", "8443")))
+    server = EnclaveHTTPServer(
+        address,
+        service,
+        tls,
+        max_connections=int(os.environ.get("MAX_CONNECTIONS", "32")),
+        max_body_bytes=int(os.environ.get("MAX_BODY_BYTES", str(8 * 1024 * 1024))),
+    )
+    log.info("enclave ready key_id=%s pcr0=%s", service.key_id.hex(), service.pcr0.hex())
     server.serve_forever()
 
 
+def healthcheck() -> None:
+    socket.create_connection(("127.0.0.1", int(os.environ.get("PORT", "8443"))), timeout=2).close()
+
+
 if __name__ == "__main__":
-    run_server()
+    main()
