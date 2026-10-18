@@ -143,9 +143,7 @@ def test_a_relayer_that_lost_its_tx_hash_finds_it_by_scanning_back_in_windows(
     assert nonce(rpc_url) == used
 
 
-def test_an_anchor_outside_the_scanned_range_yields_no_tx_hash_rather_than_an_empty_one(
-    rpc_url: str,
-) -> None:
+def test_an_anchor_outside_the_scanned_range_yields_no_tx_hash(rpc_url: str) -> None:
     relayer, _ = relayer_for(rpc_url)
     lose_a_transaction(relayer, rpc_url, b"\x06" * 32)
     w3 = Web3(Web3.HTTPProvider(rpc_url))
