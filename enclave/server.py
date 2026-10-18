@@ -16,7 +16,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from enclave.nsm_client import UnixSocketNsm
 from enclave.service import EnclaveError, EnclaveKeys, EnclaveService
-from enclave.tls import is_parent, server_context
+from enclave.tls import TlsIdentity, is_parent
+from enclave.workers import WorkerPool
 
 READ_CHUNK_BYTES: Final = 64 * 1024
 
@@ -31,18 +32,19 @@ class EnclaveHTTPServer(ThreadingHTTPServer):
         self,
         address: tuple[str, int],
         service: EnclaveService,
-        tls_context: ssl.SSLContext,
+        tls: TlsIdentity,
         *,
         max_connections: int = 32,
         max_body_bytes: int = 8 * 1024 * 1024,
         io_timeout: float = 10.0,
     ) -> None:
         self.service = service
-        self.tls_context = tls_context
+        self.tls = tls
         self.max_body_bytes = max_body_bytes
         self.io_timeout = io_timeout
         self._slots = threading.BoundedSemaphore(max_connections)
-        super().__init__(address, EnclaveHandler)
+        # finish_request builds each handler itself, passing the connection's certificate.
+        super().__init__(address, EnclaveHandler)  # type: ignore[arg-type]
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._slots.acquire(blocking=False):
@@ -63,8 +65,9 @@ class EnclaveHTTPServer(ThreadingHTTPServer):
 
     def finish_request(self, request: Any, client_address: Any) -> None:
         request.settimeout(self.io_timeout)
+        context, certificate = self.tls.current()
         try:
-            connection = self.tls_context.wrap_socket(request, server_side=True)
+            connection = context.wrap_socket(request, server_side=True)
         except (ssl.SSLError, OSError) as exc:
             log.info("TLS handshake failed: %s", type(exc).__name__)
             return
@@ -72,7 +75,7 @@ class EnclaveHTTPServer(ThreadingHTTPServer):
             if not is_parent(connection.getpeercert()):
                 log.warning("refused client certificate without the parent name")
                 return
-            EnclaveHandler(connection, client_address, self)
+            EnclaveHandler(connection, client_address, self, certificate)
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         log.error("connection failed: %s", type(sys.exc_info()[1]).__name__)
@@ -82,6 +85,12 @@ class EnclaveHandler(BaseHTTPRequestHandler):
     server: EnclaveHTTPServer
     server_version = "enclave"
     sys_version = ""
+
+    def __init__(
+        self, request: Any, client_address: Any, server: EnclaveHTTPServer, certificate: bytes
+    ) -> None:
+        self.certificate = certificate
+        super().__init__(request, client_address, server)
 
     def do_GET(self) -> None:
         url = urlsplit(self.path)
@@ -93,7 +102,7 @@ class EnclaveHandler(BaseHTTPRequestHandler):
                 nonce = bytes.fromhex(nonces[0]) if len(nonces) == 1 else b""
             except ValueError:
                 nonce = b""
-            self._run(lambda: self.server.service.attestation(nonce))
+            self._run(lambda: self.server.service.attestation(nonce, self.certificate))
         else:
             self._error(404, "not_found")
 
@@ -161,16 +170,18 @@ class EnclaveHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    keys = EnclaveKeys.generate()
-    service = EnclaveService(UnixSocketNsm(os.environ.get("NSM_SOCKET", "/run/nsm/nsm.sock")), keys)
-    context = server_context(
-        keys.tls_key, keys.tls_certificate, Path(os.environ["PARENT_CA"]).read_bytes()
+    extract = WorkerPool(
+        workers=int(os.environ.get("EXTRACT_WORKERS", "2")),
+        deadline=float(os.environ.get("PROCESS_DEADLINE_SECONDS", "10")),
     )
+    nsm = UnixSocketNsm(os.environ.get("NSM_SOCKET", "/run/nsm/nsm.sock"))
+    service = EnclaveService(nsm, EnclaveKeys.generate(), extract)
+    tls = TlsIdentity(Path(os.environ["PARENT_CA"]).read_bytes())
     address = (os.environ.get("BIND_HOST", "0.0.0.0"), int(os.environ.get("PORT", "8443")))
     server = EnclaveHTTPServer(
         address,
         service,
-        context,
+        tls,
         max_connections=int(os.environ.get("MAX_CONNECTIONS", "32")),
         max_body_bytes=int(os.environ.get("MAX_BODY_BYTES", str(8 * 1024 * 1024))),
     )

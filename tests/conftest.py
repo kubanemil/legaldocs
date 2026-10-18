@@ -8,6 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from client.sdk import LegalDocsClient
+from enclave.extractor import extract_fields
 from enclave.service import EnclaveError, EnclaveKeys, EnclaveService
 from nsm.device import MockNsm
 from nsm.measure import measure
@@ -36,9 +37,12 @@ def policy(nsm: MockNsm, pcrs: dict[int, bytes]) -> Policy:
     return Policy(nsm.root_certificate, pcrs[0])
 
 
+IN_PROCESS_TLS_CERTIFICATE = b"no TLS in process"
+
+
 @pytest.fixture
 def enclave(nsm: MockNsm) -> EnclaveService:
-    return EnclaveService(nsm, EnclaveKeys.generate())
+    return EnclaveService(nsm, EnclaveKeys.generate(), extract_fields)
 
 
 class InProcessLink:
@@ -49,7 +53,7 @@ class InProcessLink:
         self.traffic: list[bytes] = []
 
     def attestation(self, nonce: bytes) -> bytes:
-        document = self.enclave.attestation(nonce)
+        document = self.enclave.attestation(nonce, IN_PROCESS_TLS_CERTIFICATE)
         self.traffic.append(document)
         return document
 
@@ -77,17 +81,20 @@ class Stack:
         self.sessions: sessionmaker[Session] = sessionmaker(engine, expire_on_commit=False)
         self.enqueued: list[tuple[str, UUID]] = []
         self.process_inline = True
+        self.broker_down = False
         app = create_app(Services(self.sessions, link, self._enqueue, max_envelope_bytes))
         self.http = TestClient(app)
 
     def _enqueue(self, tenant_id: str, document_id: UUID) -> None:
+        if self.broker_down:
+            raise ConnectionError("broker unreachable")
         self.enqueued.append((tenant_id, document_id))
         if self.process_inline:
             self.run(tenant_id, document_id)
 
     def run(self, tenant_id: str, document_id: UUID) -> None:
         with self.sessions() as session:
-            pipeline.process_document(session, self.link, tenant_id, document_id)
+            pipeline.process_document(session, self.link, tenant_id, document_id, last_attempt=True)
 
     def tenant(self, tenant_id: str) -> str:
         with self.sessions() as session:

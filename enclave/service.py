@@ -7,16 +7,14 @@ envelopes sealed to the old key fail with `stale_key` (see README, "Key lifetime
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
-from cryptography import x509
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519, x25519
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 
-from enclave.extractor import extract_fields
+from enclave import workers
 from enclave.nsm_client import Nsm
-from enclave.tls import self_signed_certificate
 from protocol import envelope, receipt
 from protocol.attestation import enclave_user_data
 from protocol.envelope import Envelope
@@ -41,36 +39,29 @@ class EnclaveError(Exception):
 class EnclaveKeys:
     encryption: x25519.X25519PrivateKey
     signing: ed25519.Ed25519PrivateKey
-    tls_key: ec.EllipticCurvePrivateKey
-    tls_certificate: x509.Certificate
 
     @classmethod
     def generate(cls) -> "EnclaveKeys":
-        tls_key = ec.generate_private_key(ec.SECP256R1())
-        return cls(
-            encryption=x25519.X25519PrivateKey.generate(),
-            signing=ed25519.Ed25519PrivateKey.generate(),
-            tls_key=tls_key,
-            tls_certificate=self_signed_certificate(tls_key),
-        )
+        return cls(x25519.X25519PrivateKey.generate(), ed25519.Ed25519PrivateKey.generate())
 
 
 class EnclaveService:
-    def __init__(self, nsm: Nsm, keys: EnclaveKeys) -> None:
+    def __init__(
+        self, nsm: Nsm, keys: EnclaveKeys, extract: Callable[[str], dict[str, Any]]
+    ) -> None:
         self._nsm = nsm
         self._keys = keys
+        self._extract = extract
         self.pcr0 = nsm.describe_pcr(0)
         self.key_id = envelope.key_id(keys.encryption.public_key())
         self._public_key = envelope.raw_public_key(keys.encryption.public_key())
-        self._user_data = enclave_user_data(
-            keys.signing.public_key(),
-            keys.tls_certificate.public_bytes(serialization.Encoding.DER),
-        )
 
-    def attestation(self, nonce: bytes) -> bytes:
+    def attestation(self, nonce: bytes, tls_certificate: bytes) -> bytes:
+        """Attest this enclave's keys and the TLS certificate the caller is connected through."""
         if not MIN_NONCE_BYTES <= len(nonce) <= MAX_NONCE_BYTES:
             raise EnclaveError("bad_request")
-        return self._nsm.attest(public_key=self._public_key, user_data=self._user_data, nonce=nonce)
+        user_data = enclave_user_data(self._keys.signing.public_key(), tls_certificate)
+        return self._nsm.attest(public_key=self._public_key, user_data=user_data, nonce=nonce)
 
     def process(self, body: bytes) -> bytes:
         try:
@@ -86,7 +77,13 @@ class EnclaveService:
             log.info("rejected request: %s", type(exc).__name__)
             raise EnclaveError("bad_request") from None
 
-        result = json.dumps(extract_fields(text), sort_keys=True, ensure_ascii=False).encode()
+        try:
+            fields = self._extract(text)
+        except workers.Timeout:
+            raise EnclaveError("processing_timeout", 422) from None
+        except workers.Busy:
+            raise EnclaveError("busy", 503) from None
+        result = json.dumps(fields, sort_keys=True, ensure_ascii=False).encode()
         signed = receipt.sign(
             receipt.Receipt(
                 binding=request.binding.digest(),

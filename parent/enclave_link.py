@@ -13,8 +13,11 @@ import logging
 import os
 import ssl
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+
+from cryptography import x509
 
 from protocol.attestation import ENCLAVE_TLS_NAME, AttestationError, Policy, verify_enclave
 from protocol.messages import ProcessRequest, ProcessResponse
@@ -77,6 +80,8 @@ class AttestedTlsLink:
                 status, payload, _ = self._send(self._context(), method, path, body)
             except ssl.SSLCertVerificationError as exc:
                 raise EnclaveUnavailable("enclave certificate is not the attested one") from exc
+        if status == 503:
+            raise EnclaveUnavailable(f"enclave is busy: {_error_code(payload)}")
         if status != 200:
             raise EnclaveRejected(_error_code(payload), status)
         return payload
@@ -118,6 +123,14 @@ class AttestedTlsLink:
         status, document, peer = self._send(probe, "GET", f"/attestation?nonce={nonce.hex()}", None)
         if status != 200 or not peer:
             raise EnclaveUnavailable("enclave did not return an attestation")
+        certificate = x509.load_der_x509_certificate(peer)
+        if (
+            not certificate.not_valid_before_utc
+            <= datetime.now(UTC)
+            <= certificate.not_valid_after_utc
+        ):
+            log.error("enclave serves a TLS certificate outside its validity period")
+            raise EnclaveUnavailable("enclave TLS certificate is not currently valid")
 
         policy = Policy.from_pem(self._trust_anchor.read_bytes(), self._expected_pcr0)
         try:

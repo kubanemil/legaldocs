@@ -1,13 +1,16 @@
-"""The enclave's TLS identity: a key made at boot and a self-signed certificate.
+"""The enclave's TLS identity: a key made in memory and a self-signed certificate.
 
 Nobody issues this certificate. The parent trusts it only after an attestation document
-binds its hash to the enclave's measured code (attested TLS).
+binds its hash to the enclave's measured code (attested TLS). The key and certificate are
+replaced halfway through their lifetime; a parent pinned to the old one fails its next
+handshake and re-attests.
 """
 
 import secrets
 import ssl
 import tempfile
-from collections.abc import Mapping
+import threading
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
@@ -22,10 +25,50 @@ from protocol.attestation import ENCLAVE_TLS_NAME, PARENT_TLS_NAME
 LIFETIME: Final = timedelta(hours=24)
 
 
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+class TlsIdentity:
+    def __init__(
+        self,
+        parent_ca_pem: bytes,
+        lifetime: timedelta = LIFETIME,
+        clock: Callable[[], datetime] = _now,
+    ) -> None:
+        self._parent_ca_pem = parent_ca_pem
+        self._lifetime = lifetime
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._current = self._issue()
+
+    def current(self) -> tuple[ssl.SSLContext, bytes]:
+        """The context to serve the next connection with, and its certificate in DER."""
+        with self._lock:
+            context, certificate, renew_at = self._current
+            if self._clock() >= renew_at:
+                self._current = self._issue()
+                context, certificate, _ = self._current
+            return context, certificate
+
+    def _issue(self) -> tuple[ssl.SSLContext, bytes, datetime]:
+        now = self._clock()
+        key = ec.generate_private_key(ec.SECP256R1())
+        certificate = self_signed_certificate(key, now, self._lifetime)
+        context = server_context(key, certificate, self._parent_ca_pem)
+        return (
+            context,
+            certificate.public_bytes(serialization.Encoding.DER),
+            now + self._lifetime / 2,
+        )
+
+
 def self_signed_certificate(
-    key: ec.EllipticCurvePrivateKey, hostname: str = ENCLAVE_TLS_NAME
+    key: ec.EllipticCurvePrivateKey,
+    now: datetime,
+    lifetime: timedelta = LIFETIME,
+    hostname: str = ENCLAVE_TLS_NAME,
 ) -> x509.Certificate:
-    now = datetime.now(UTC)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
     return (
         x509.CertificateBuilder()
@@ -34,7 +77,7 @@ def self_signed_certificate(
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - timedelta(minutes=1))
-        .not_valid_after(now + LIFETIME)
+        .not_valid_after(now + lifetime)
         .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(
